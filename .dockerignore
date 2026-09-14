@@ -1,0 +1,23 @@
+# Shrink the build context for both Dockerfile and Dockerfile.prebuilt.
+# NOTE: dist/ is intentionally NOT ignored — Dockerfile.prebuilt COPYs the
+# prebuilt linux binary from it.
+
+# VCS
+.git
+.gitignore
+
+# Not needed inside the image
+testdata
+docs
+scripts
+deploy
+Makefile
+ARCHITECTURE.md
+TASKS.md
+README.md
+
+# Local binaries and test artifacts
+/file-edit-mcp
+file-edit-mcp-linux-*
+*.test
+.coverage

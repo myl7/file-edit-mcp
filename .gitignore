@@ -1,0 +1,5 @@
+/file-edit-mcp
+file-edit-mcp-linux-*/
+dist/
+*.test
+.coverage

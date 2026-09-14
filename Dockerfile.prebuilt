@@ -1,0 +1,37 @@
+# Release image (ARCHITECTURE.md §10): built on the dev machine from the
+# prebuilt linux/amd64 binary (make linux VERSION=...) and pushed to Docker
+# Hub; deploy hosts only ever pull.
+#
+#   make linux VERSION=v0.1.0
+#   docker buildx build --platform linux/amd64 -f Dockerfile.prebuilt \
+#       -t <user>/file-edit-mcp:v0.1.0 --load .
+#   docker push <user>/file-edit-mcp:v0.1.0
+#
+# scratch keeps the image at alpine-class size: the static binary, ripgrep,
+# and ripgrep's three shared libraries. No package manager, no shell. PATH
+# must name /usr/bin, otherwise exec.LookPath cannot find rg and the grep
+# tool silently degrades to the slow in-process engine.
+FROM alpine:3.20 AS rg
+RUN apk add --no-cache ripgrep
+
+FROM scratch
+COPY --from=rg /usr/bin/rg /usr/bin/rg
+COPY --from=rg /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
+COPY --from=rg /usr/lib/libpcre2-8.so.0 /usr/lib/libpcre2-8.so.0
+COPY --from=rg /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1
+COPY dist/file-edit-mcp-linux-amd64 /usr/local/bin/file-edit-mcp
+
+# Resident HTTP server form (ARCHITECTURE.md §0/§10): the binary is the
+# entrypoint, serving streamable HTTP on :8080 with the MCP endpoint at
+# /{token}/mcp. Compose files override CMD as a whole (e.g. a narrower
+# --allow). Auth is token-path, no reverse proxy needed: FILE_EDIT_MCP_TOKEN
+# must be set in the container environment (required for --transport http;
+# 1-128 chars of [A-Za-z0-9_-], leading alphanumeric) and clients connect to
+# /<token>/mcp — rotate by changing the env and recreating the container.
+# The bind-mounted share subtree does not track remounts (subtree binds
+# cannot); recover from a stale mount by restarting the container from the
+# host.
+ENV PATH=/usr/bin
+ENTRYPOINT ["/usr/local/bin/file-edit-mcp"]
+CMD ["--transport", "http", "--addr", ":8080", "--allow", "/data"]
+EXPOSE 8080
