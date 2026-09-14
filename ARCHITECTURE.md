@@ -15,7 +15,13 @@
   注入 ServeMux 语法）。其余路径（含旧 `/mcp`、错误 token、`/`）一律 mux 404，不达 MCP handler；
   token 绝不写 stderr 日志（endpoint 以 `/<token>/mcp` 占位符记录）。**每个 HTTP 连接一个独立
   `*mcp.Server` 实例**（SDK StreamableHTTPHandler 的 GetServer 回调），即会话状态按连接隔离，
-  与原来「每会话一进程」语义等价。**不再前置 nginx basic auth**：token 即唯一鉴权，轮换 = 改
+  与原来「每会话一进程」语义等价。server 必须保持 stateful（按会话 read-before-write 标记即
+  核心安全特性，`Stateless=true` 会毁掉它们），而 SDK 对 `MCP-Protocol-Version: 2026-07-28`
+  （SEP-2567 无会话协议，新版客户端 discover 后会带上）在 stateful server 上直接 400，故在
+  token 路由之内、SDK handler 之外加一层改写中间件：请求头版本不在本 server 实际支持的版本集
+  （2024-11-05、2025-03-26、2025-06-18、2025-11-25）内即改写为 initialize 协商上限
+  2025-11-25（未知/未来版本同样改写，保持向前兼容）；改写后的 batch POST 仍会按 ≥2025-06-18
+  的规范规则被 SDK 拒绝，属规范行为，刻意不绕过。**不再前置 nginx basic auth**：token 即唯一鉴权，轮换 = 改
   环境变量 + 重建容器。
 - server instructions（MCP 的 AGENTS.md 等价物）：initialize result 的 `instructions` 字段在
   每次构造 server（stdio 与每个 HTTP 会话）时设置。默认文本仅一句话：插值实际允许目录的根

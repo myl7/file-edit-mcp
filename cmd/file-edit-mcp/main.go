@@ -200,9 +200,11 @@ func runHTTP(ctx context.Context, shared *tools.Shared, logger *slog.Logger, add
 
 // newMCPHandler builds the token-path routing (§0): exactly one route —
 // "/"+token+"/mcp", a Go 1.22 exact-match pattern (no trailing slash) — to
-// the SDK StreamableHTTP handler wrapped by connLogging. Every other path
-// (the old /mcp, wrong tokens, /) falls through to the ServeMux default 404
-// and is never seen by connLogging: a 404 is not a connection event.
+// the SDK StreamableHTTP handler, wrapped by connLogging (connection
+// lifecycle audit) inside versionRewrite (protocol-version guard, see
+// statefulProtocolVersions). Every other path (the old /mcp, wrong tokens,
+// /) falls through to the ServeMux default 404 and is never seen by either
+// wrapper: a 404 is not a connection event.
 //
 // The SDK handler does not inspect the URL path at all (verified against the
 // go-sdk v1.7.0 source), so POST initialize, the standalone SSE GET stream,
@@ -227,8 +229,84 @@ func newMCPHandler(shared *tools.Shared, logger *slog.Logger, token string) *htt
 		return srv
 	}, &mcp.StreamableHTTPOptions{Logger: logger})
 	mux := http.NewServeMux()
-	mux.Handle("/"+token+"/mcp", connLogging(h, logger))
+	// Chain order: versionRewrite runs first (outside), connLogging closest
+	// to the SDK. Rewriting the version header before anything else sees the
+	// request keeps connLogging semantics untouched — it reads Mcp-Session-Id
+	// and status codes only — while the SDK handler never observes a version
+	// a stateful server cannot answer.
+	mux.Handle("/"+token+"/mcp", versionRewrite(connLogging(h, logger)))
 	return mux
+}
+
+// mcpProtocolVersionHeader is the MCP-Protocol-Version request header
+// (spec 2025-06-18 §2.7): clients stamp the negotiated version on every
+// post-initialize request. http.Header.Get/Set canonicalize the key, so the
+// casing clients send is irrelevant here.
+const mcpProtocolVersionHeader = "MCP-Protocol-Version"
+
+// statefulProtocolVersions is the exact set of MCP protocol versions this
+// server's stateful HTTP transport speaks — everything the go-sdk v1.7.0
+// supports on a stateful StreamableHTTPHandler. The SDK also knows
+// "2026-07-28" (the SEP-2567 sessionless protocol), but a stateful server
+// must reject any request carrying it with HTTP 400 "protocol version ...
+// is only supported on stateless HTTP servers" (mcp/streamable.go,
+// serveStatefulPOST), and Stateless=true is not negotiable here: the
+// per-session read-before-write markers ARE the safety model (§0), and they
+// need one resident session per connection — exactly what the sessionless
+// protocol removes. The initialize negotiation already caps the session at
+// "2025-11-25" (SDK shared.go negotiatedVersion returns 2025-11-25 for
+// anything it does not pass through), so rewriting a client's stray
+// 2026-07-28 header down into this set keeps the wire consistent with what
+// the InitializeResult told the client. Unknown/future versions get the
+// same rewrite: forward tolerance without chasing every SDK release.
+var statefulProtocolVersions = map[string]struct{}{
+	"2024-11-05": {},
+	"2025-03-26": {},
+	"2025-06-18": {},
+	"2025-11-25": {},
+}
+
+// rewriteProtocolVersion decides what MCP-Protocol-Version value the
+// stateful server should act on for an incoming v: an accepted version (or
+// empty — pre-handshake requests legitimately omit the header; the SDK
+// treats that as "version unknown, may be any initialize") passes through
+// verbatim; anything else — "2026-07-28" (stateless-only, hard 400 on a
+// stateful server) or an unknown/future version — becomes "2025-11-25",
+// the initialize-negotiation cap. Pure on purpose: tests pin the decision
+// table without any HTTP.
+func rewriteProtocolVersion(v string) string {
+	if v == "" {
+		return ""
+	}
+	if _, ok := statefulProtocolVersions[v]; ok {
+		return v
+	}
+	return "2025-11-25"
+}
+
+// versionRewrite wraps the MCP endpoint and rewrites the
+// MCP-Protocol-Version request header down to a version the stateful server
+// actually speaks. Constraint it enforces: this server MUST stay stateful
+// (per-session read-before-write markers, §0), so a modern client that
+// upgrades to the sessionless "2026-07-28" header after the discover flow
+// must not have every post-initialize request die in the SDK's
+// stateful-only 400 — rewriteProtocolVersion downgrades such headers (and
+// unknown future ones) to "2025-11-25" before the SDK handler parses
+// anything. It sits outside connLogging (unchanged: it audits session
+// opens/closes, not versions) and inside the token-path route, so only
+// token-bearing traffic is rewritten. Deliberately NOT worked around: a
+// batched JSON-RPC POST carrying a rewritten version can still be refused
+// with 400 "JSON-RPC batching is not supported in 2025-06-18 and later" —
+// that is spec-mandated behavior for >= 2025-06-18, not a bug.
+func versionRewrite(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := r.Header.Get(mcpProtocolVersionHeader); v != "" {
+			if nv := rewriteProtocolVersion(v); nv != v {
+				r.Header.Set(mcpProtocolVersionHeader, nv)
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // validateToken reports whether token fits tokenRE. Pure on purpose: run()
