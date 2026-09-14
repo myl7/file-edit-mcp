@@ -86,22 +86,23 @@ func NewShared(allowedDirs []string, log *slog.Logger) (*Shared, error) {
 // Conn is the read-marker and per-path-lock state (§7) layered over the
 // process-wide Shared state. Scope is per transport (§0): stdio builds
 // exactly one — one process is one session anyway — and the stateless HTTP
-// transport builds ONE for the lifetime of the HTTP handler, registering it
-// on every per-request *mcp.Server its StreamableHTTP GetServer callback
-// constructs. HTTP markers are therefore PROCESS-wide by design (the
-// approved semantics change that came with the stateless 2026-07-28
-// protocol, SEP-2567): EUnreadWrite means the file was not read anywhere in
-// this process, EStaleRead means it changed since the last read or write
-// this process saw. Cross-connection marker isolation is deliberately gone:
-// the sessionless handshake ChatGPT connectors speak (discover-first, and
-// openai-mcp/1.0.0 implements NO fallback to the legacy initialize
-// handshake) has no session to isolate along, and the deployment is
-// single-user (token-path auth = one bearer of the one token). The
-// stale-read fence still holds unchanged: every write re-stats the file and
-// rejects with EStaleRead whenever size or mtime moved since the process's
-// last-seen state, so an out-of-band writer can only cause a rejected edit,
-// never a silent overwrite; same-path writes stay serialized because the
-// per-path lock table is process-wide now too.
+// transport builds ONE PER TOKEN for the lifetime of the HTTP handler
+// (token-as-session: the token in /{token}/mcp is the session identity),
+// registering it on every per-request *mcp.Server that route's
+// StreamableHTTP GetServer callback constructs. Marker semantics follow
+// that scope: EUnreadWrite is PER TOKEN (a file read under token A does
+// not authorize a write under token B — the cross-client isolation the
+// stateless 2026-07-28 protocol, SEP-2567, removed is restored along the
+// one axis that protocol leaves standing, the credential), while
+// EStaleRead compares against the file's CURRENT state, so ANY writer —
+// another token or an out-of-band disk change — stales every other
+// token's marker for that path. Within one token the markers persist
+// across stateless requests (statelessness carries no sessions, but the
+// Conn does) and reset on process restart. Cross-token same-file
+// concurrency is safe without a shared lock: each write is an atomic
+// temp+rename, and the editor's pre-write re-stat turns the loser of a
+// race into EStaleRead, never a silent overwrite; same-path writes under
+// ONE token stay serialized by that token's per-path lock table.
 //
 // Concurrent use by overlapping requests is safe: Session guards markers
 // and locks behind one mutex (verified with -race), and Register is pure
@@ -116,9 +117,10 @@ type Conn struct {
 
 // NewConn returns a fresh connection state over s: an empty session, sharing
 // s's Guard, Root pool, and Retrier. stdio calls it once per process; the
-// stateless HTTP transport calls it once for the HTTP handler's lifetime and
-// registers the result on every per-request server (see Conn for the
-// process-wide marker scope that follows). Safe to call concurrently.
+// stateless HTTP transport calls it once per token for the HTTP handler's
+// lifetime and registers the result on every per-request server of that
+// token's route (see Conn for the per-token marker scope that follows).
+// Safe to call concurrently.
 func (s *Shared) NewConn() *Conn {
 	return &Conn{Shared: s, Sess: session.New()}
 }

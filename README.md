@@ -5,10 +5,10 @@ An MCP (Model Context Protocol) server exposing six file tools — `read`, `writ
 ## Security model
 
 - **Root scoping.** Only absolute paths under the `--allow` roots are served. Validation is a pipeline: clean/abs normalization, prefix comparison against the allowed roots, then a realpath pass with a second prefix comparison; file operations go through `os.Root` (openat semantics), so `..` traversal and symlink swaps cannot escape a validated root.
-- **Read-before-write.** `write`/`edit`/`multi_edit` on an existing file that has not been read are rejected (`EUnreadWrite`); `edit`/`multi_edit` additionally re-check size/mtime at write time and reject stale reads (`EStaleRead`), so a concurrent writer can cause a rejected edit but never a silent overwrite. Over stdio the marker scope is the process (one connection); over HTTP it is also the process — one shared marker set for every request of every client — because the stateless transport ChatGPT connectors require has no sessions to isolate along, and the deployment model is a single user behind a single token.
+- **Read-before-write.** `write`/`edit`/`multi_edit` on an existing file that has not been read are rejected (`EUnreadWrite`); `edit`/`multi_edit` additionally re-check size/mtime at write time and reject stale reads (`EStaleRead`), so a concurrent writer can cause a rejected edit but never a silent overwrite. Over stdio the marker scope is the process (one connection); over HTTP the marker scope is the token — every stateless request carrying the same token shares one marker set, so two clients on different tokens cannot unlock writes for each other, while any writer (another token or an out-of-band disk change) stales every other token's marker for that path until it re-reads. Markers reset when the process restarts.
 - **Atomic writes.** Content lands via a same-directory temp file plus rename; a failed write leaves the original file untouched.
 - **No execution surface.** The only subprocess is `rg` behind `grep`, with arguments built by the server from typed fields — no shell, no user-controlled command line.
-- **Token-path auth (HTTP).** The MCP endpoint is `/{token}/mcp`; the token comes from `FILE_EDIT_MCP_TOKEN`. Every other path — including wrong tokens — is a plain 404 that never reaches the MCP handler, and the token never appears in logs. A leaked token is full access to the allowed roots: bind the port to loopback or an internal interface only.
+- **Token-path auth (HTTP).** The MCP endpoints are `/{token}/mcp`; tokens come from `FILE_EDIT_MCP_TOKENS` (a comma-separated list — one endpoint per client) or the single `FILE_EDIT_MCP_TOKEN`. Every other path — including wrong tokens — is a plain 404 that never reaches the MCP handler, and tokens never appear in logs. A leaked token is still full access to the allowed roots: bind the port to loopback or an internal interface only, and hand each client its own token so a compromised one can be rotated out of the list independently.
 
 ## Quick start
 
@@ -48,7 +48,16 @@ The MCP endpoint is then `http://127.0.0.1:8080/secret-token/mcp`. The HTTP tran
 }
 ```
 
-`FILE_EDIT_MCP_TOKEN` is required with `--transport http` and ignored with stdio. The token must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$` (1–128 characters from `[A-Za-z0-9_-]`, leading alphanumeric — URL-path-segment safe and free of routing metacharacters); a missing or invalid token fails at startup, before any route is built. Rotating the token means changing the variable and recreating the process/container.
+`FILE_EDIT_MCP_TOKEN` is required with `--transport http` (unless `FILE_EDIT_MCP_TOKENS` is set) and ignored with stdio. Every token must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$` (1–128 characters from `[A-Za-z0-9_-]`, leading alphanumeric — URL-path-segment safe and free of routing metacharacters); a missing or invalid token fails at startup, before any route is built. Rotating a token means changing the variable and recreating the process/container.
+
+#### Multiple tokens (one session per client)
+
+```sh
+FILE_EDIT_MCP_TOKENS="client-a-token,client-b-token,client-c-token" \
+  ./file-edit-mcp --transport http --addr 127.0.0.1:8080 --allow /data
+```
+
+Each entry in the comma-separated `FILE_EDIT_MCP_TOKENS` becomes its own endpoint (`http://HOST:PORT/client-a-token/mcp`, `.../client-b-token/mcp`, …) backed by its own session state — hand each client one URL. The token is the session identity: read-before-write markers are tracked per token, so a file read over one token's URL does not authorize edits over another's, which restores cross-client isolation on the stateless transport. Any writer — another token or an out-of-band change on disk — still stales every other token's marker for that file (`EStaleRead`) until each re-reads, and same-file writes stay safe (atomic temp+rename; the loser of a race gets `EStaleRead`, never a silent overwrite). Markers persist across requests under one token and reset on process restart. Entries are whitespace-trimmed; empty entries and duplicates are startup errors naming the entry position (never the value), and when both variables are set `FILE_EDIT_MCP_TOKENS` wins. A leaked token still grants full access to the allowed roots — the isolation is between clients, not against the server.
 
 ## Docker
 
@@ -64,7 +73,8 @@ services:
     image: myl7/file-edit-mcp:v0.2.1
     restart: always
     environment:
-      - FILE_EDIT_MCP_TOKEN=change-me   # endpoint becomes /change-me/mcp
+      - FILE_EDIT_MCP_TOKENS=client-a-token,client-b-token   # endpoints /client-a-token/mcp, /client-b-token/mcp
+      # - FILE_EDIT_MCP_TOKEN=change-me   # single-token form: endpoint becomes /change-me/mcp
       - FILE_EDIT_MCP_INSTRUCTIONS=A notes vault; files are UTF-8 markdown.   # optional, see below
     ports:
       - "127.0.0.1:8080:8080"

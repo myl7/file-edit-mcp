@@ -10,26 +10,35 @@
 - 语言/框架：**Go 1.27 + 官方 SDK `github.com/modelcontextprotocol/go-sdk/mcp`**，stdio transport。
 - 传输：**stdio 与 streamable HTTP 双支持**（`--transport stdio|http`，默认 stdio 本地调试用）。
   HTTP 模式监听 `--addr`（默认 `:8080`），MCP 端点挂 `/{token}/mcp`——**token-path 鉴权**：URL
-  路径即凭证，token 来自环境变量 `FILE_EDIT_MCP_TOKEN`（http 模式必填，缺省/空值或字符集非法
-  启动即报错；校验 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`，先于路由 pattern 构造，保证 token 无法
-  注入 ServeMux 语法）。其余路径（含旧 `/mcp`、错误 token、`/`）一律 mux 404，不达 MCP handler；
-  token 绝不写 stderr 日志（endpoint 以 `/<token>/mcp` 占位符记录）。token-path 鉴权与 keepalive
-  不因 transport 改版而变。HTTP transport 为 **stateless**（SDK StreamableHTTPHandler
-  `Stateless: true`；2026-09 实测）：ChatGPT custom connector 创建强制要求 2026-07-28 无会话协议
-  （SEP-2567），其客户端（openai-mcp/1.0.0）discover-first 且**没有**回退到 legacy initialize
-  握手的实现，而 stateful server 对这类流量一律 400。stateless 下 SDK 原生同时服务两端：
-  `server/discover` 自带完整正确应答（含 instructions、advertise 2026-07-28 及各 legacy 版本），
-  ≥2026-07-28 请求的 SEP-2243 头（`Mcp-Method`/`Mcp-Name`）由 SDK 强制校验，legacy
-  initialize-then-call 流量靠每请求合成的会话状态照常工作——故此前为 stateful server 手写的
-  discover 应答与版本改写中间件全部移除（git 历史留档）。stateless 无会话：GET/DELETE 一律
-  405、响应不设 `Mcp-Session-Id`，连接开/关日志无从谈起（已删），审计面是前置 nginx 的
-  access log。**每请求一个 `*mcp.Server`**（GetServer 回调；SDK 文档明示可每次返回新实例），
-  六工具注册在 **HTTP handler 生命周期唯一的 `tools.Conn`** 上——per-request Conn 会令 read
-  标记随请求重置、每次写都 EUnreadWrite；唯一 Conn 使标记**进程级**（已批准的语义变更，§7）：
-  EUnreadWrite = 本进程从未读过该文件，EStaleRead = 自本进程最后一次读/写后文件被进程外改动；
-  跨连接隔离刻意取消——无会话协议没有会话可隔离，单用户单 token 部署下无实际影响，stale-read
-  栅栏与同路径写串行化（锁表同样进程级）不变。**不再前置 nginx basic auth**：token 即唯一鉴权，
-  轮换 = 改环境变量 + 重建容器。
+  路径即凭证，token 来自环境变量 `FILE_EDIT_MCP_TOKENS`（逗号分隔列表，http 模式至少一项；
+  条目两端空白裁剪；空条目、重复条目、字符集非法均启动即报错，错误按 1-based 位次指认条目
+  且**绝不回显值**——重复显式拒绝而非静默去重，operator 的笔误必须响亮，不能静默少一个端点；
+  两者同设时 `TOKENS` 优先、`TOKENS` 未设/为空则回退单 token 变量 `FILE_EDIT_MCP_TOKEN`，
+  此为文档化优先级）；逐条校验 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`，先于路由 pattern 构造，
+  保证 token 无法注入 ServeMux 语法。其余路径（含旧 `/mcp`、错误 token、`/`）一律 mux 404，
+  不达 MCP handler；token 绝不写 stderr 日志（endpoint 以 `/<token>/mcp` 占位符记录，另记
+  token 数量、不记值）。token-path 鉴权与 keepalive 不因 transport 改版而变。HTTP transport 为
+  **stateless**（SDK StreamableHTTPHandler `Stateless: true`；2026-09 实测）：ChatGPT custom
+  connector 创建强制要求 2026-07-28 无会话协议（SEP-2567），其客户端（openai-mcp/1.0.0）
+  discover-first 且**没有**回退到 legacy initialize 握手的实现，而 stateful server 对这类流量一律
+  400。stateless 下 SDK 原生同时服务两端：`server/discover` 自带完整正确应答（含 instructions、
+  advertise 2026-07-28 及各 legacy 版本），≥2026-07-28 请求的 SEP-2243 头（`Mcp-Method`/
+  `Mcp-Name`）由 SDK 强制校验，legacy initialize-then-call 流量靠每请求合成的会话状态照常
+  工作——故此前为 stateful server 手写的 discover 应答与版本改写中间件全部移除（git 历史留档）。
+  stateless 无会话：GET/DELETE 一律 405、响应不设 `Mcp-Session-Id`，连接开/关日志无从谈起
+  （已删），审计面是前置 nginx 的 access log。**每请求一个 `*mcp.Server`**（GetServer 回调；
+  SDK 文档明示可每次返回新实例），**每 token 一个 `tools.Conn`、一个专属 StreamableHTTPHandler
+  实例、一条精确匹配路由**——**token 即会话身份**（token-as-session，§7）：无会话协议没有会话
+  可隔离，但凭证轴仍在，跨客户端隔离沿 token 恢复。标记语义随此作用域：EUnreadWrite **按
+  token 判定**（token A 下读过某文件不授权 token B 下写它）；EStaleRead 与文件**当前状态**
+  比较，任何写者——另一 token 或进程外磁盘改动——都把其他所有 token 对该路径的标记打 stale；
+  同一 token 内标记跨 stateless 请求持久（进程重启即重置；per-request Conn 会令标记随请求重置、
+  每次写都 EUnreadWrite，故 Conn 在回调外构造、闭包绑定、回调内不解析路径）。跨 token 同文件
+  并发无需共享锁也安全：原子 temp+rename 写入 + 写前重 stat，输家得 EStaleRead，绝不静默覆盖；
+  同 token 内同路径写仍由该 token 的锁表串行化。多个 stateless handler 实例不共享任何会冲突的
+  状态（对 go-sdk v1.7.0 核实：handler 只持有自身 GetServer 回调/选项/会话簿记，stateless 路径
+  每请求连一个临时会话并随请求结束关闭，会话表不落条目）。**不再前置 nginx basic auth**：
+  token 即唯一鉴权，轮换 = 改环境变量 + 重建容器。
 - server instructions（MCP 的 AGENTS.md 等价物）：initialize result 的 `instructions` 字段在
   每次构造 server（stdio 一次、HTTP 每请求一次）时设置，文本在 handler 构造时解析一次共享，
   stateless discover 应答（SDK 原生）发送同一文本。默认文本仅一句话：插值实际允许目录的根
@@ -197,9 +206,12 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 ## 7. 会话与并发
 
 - 「会话」= 一个 MCP 客户端连接的生命周期——该等式现仅对 stdio 成立（一进程一连接）。HTTP
-  模式 stateless（§0）：每请求一个 server 实例，全部注册在 handler 生命周期唯一的 Conn 上，
-  已读跟踪与路径锁表因此为**进程级**（已批准的语义变更）：EUnreadWrite/EStaleRead 按进程
-  判定，跨连接隔离取消；stale-read 栅栏与同路径写串行化不变。
+  模式 stateless（§0）：每请求一个 server 实例，注册在该 token 的专属 Conn 上——**token 即
+  会话身份**：已读跟踪与路径锁表的作用域是 **token**。EUnreadWrite 按 token 判定（跨 token
+  隔离沿凭证轴恢复）；EStaleRead 对文件当前状态比较，任何写者（另一 token 或进程外改动）把
+  其他 token 的标记打 stale；同 token 内标记跨请求持久、随进程重启重置。stale-read 栅栏不变；
+  同路径写串行化在 token 内由该 token 的锁表保证，跨 token 由原子 temp+rename + 写前重 stat
+  兜底（输家 EStaleRead，绝不静默覆盖）。
 - `internal/session`：`map[resolvedPath]marker{size, mtime}`（read 成功时记录），
   外加 `map[resolvedPath]*sync.Mutex` 做同路径写串行化。全程持锁访问。
 - MCP handler 可能并发调用；所有共享状态经 session 包的锁。
@@ -253,12 +265,14 @@ Go 测试把每条 `search-replace` 喂给 editengine，比对 `new_code`。
   加静态二进制；`ENV PATH=/usr/bin` 否则 exec.LookPath 找不到 rg 会静默降级回退引擎），
   ≈ 20 MB。开发机 `make release VERSION=v0.1.0` 构建推送 Docker Hub；部署侧只 pull。
 - 部署：编排在仓库之外（部署侧只 pull 镜像、起容器）。要点：端口绑回环或内网、token-path
-  鉴权（容器环境变量 `FILE_EDIT_MCP_TOKEN`，端点 `/{token}/mcp`；不前置 nginx basic auth）、
+  鉴权（容器环境变量 `FILE_EDIT_MCP_TOKENS` 列表或 `FILE_EDIT_MCP_TOKEN` 单 token，端点
+  `/{token}/mcp` 每 token 一条；不前置 nginx basic auth）、
   数据子树 bind（见 §0；挂载失效靠宿主机重启容器恢复）。
 - CLI：`--allow DIR`（可重复，≥1）、`--transport stdio|http`、`--addr`（http 用）、
   `--keepalive DURATION`（http 用，默认 4m，0 关闭）、`--log-level`、`--version`。
-  环境变量：`FILE_EDIT_MCP_TOKEN`（http 必填，token-path 鉴权）、`FILE_EDIT_MCP_INSTRUCTIONS`
-  （可选，覆盖 initialize instructions）。
+  环境变量：`FILE_EDIT_MCP_TOKENS`（http 必填其一：逗号分隔 token 列表，每 token 一条端点
+  一个会话；同设时优先）、`FILE_EDIT_MCP_TOKEN`（http 必填其一：单 token 形式，`TOKENS`
+  未设/为空时生效）、`FILE_EDIT_MCP_INSTRUCTIONS`（可选，覆盖 initialize instructions）。
 
 ## 11. 任务分解（协调用）
 

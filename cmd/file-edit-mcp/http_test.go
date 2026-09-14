@@ -4,9 +4,11 @@
 // write→read E2E round trip, instructions coverage) and by raw POSTs in the
 // exact shapes the 2026-07-28 protocol (SEP-2567, the stateless handshake
 // ChatGPT custom connectors require) prescribes: server/discover and
-// header-stamped tools/call. Plus the process-wide marker semantics (one
-// read anywhere in the process unlocks writes from any client session; a
-// change the process never saw is EStaleRead; a never-read file stays
+// header-stamped tools/call. Plus the marker semantics in both scopes the
+// token-as-session model defines (within one token: one read anywhere
+// unlocks that token's writes across all its stateless requests; across
+// tokens: markers are isolated — EUnreadWrite — while any writer stales
+// every other token's marker — EStaleRead; a never-read file stays
 // EUnreadWrite) and the token-path routing (everything but /{token}/mcp is
 // a mux 404).
 
@@ -31,8 +33,11 @@ import (
 	"github.com/myl7/file-edit-mcp/internal/tools"
 )
 
-// testToken is the fixed token the HTTP tests configure via tokenEnv — the
-// same loadToken+newMCPHandler path run() takes, never a hand-built mux.
+// testToken is the fixed token the single-token HTTP tests configure via
+// tokenEnv — the same loadTokens+newMCPHandler path run() takes (the list
+// var stays unset, so loadTokens exercises its single-var fallback), never
+// a hand-built mux. The multi-token tests use their own tokens and the
+// list-form harness below.
 const testToken = "test-token-1"
 
 // The wire headers of the >= 2026-07-28 stateless protocol (SEP-2243): the
@@ -51,9 +56,12 @@ const (
 // discover with and never fall back from.
 const statelessProtocolVersion = "2026-07-28"
 
-// startHTTPTestServer boots the production HTTP assembly (loadToken +
-// newMCPHandler) over one fresh temp allowed dir, exactly as run() and
-// runHTTP do minus the http.Server/keepalive plumbing.
+// startHTTPTestServer boots the production single-token HTTP assembly
+// (loadTokens over tokenEnv + newMCPHandler) over one fresh temp allowed
+// dir, exactly as run() and runHTTP do minus the http.Server/keepalive
+// plumbing. The list var is left unset on purpose: these tests pin the
+// single-var fallback form and stay untouched by the multi-token work; the
+// list-form twin is startMultiTokenHTTPTestServer.
 func startHTTPTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -62,32 +70,76 @@ func startHTTPTestServer(t *testing.T) (*httptest.Server, string) {
 		t.Fatalf("EvalSymlinks(%s): %v", dir, err)
 	}
 	t.Setenv(tokenEnv, testToken)
-	token, err := loadToken()
+	t.Setenv(tokensEnv, "")
+	tokens, err := loadTokens()
 	if err != nil {
-		t.Fatalf("loadToken: %v", err)
+		t.Fatalf("loadTokens: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	shared, err := tools.NewShared([]string{dir}, logger)
 	if err != nil {
 		t.Fatalf("tools.NewShared: %v", err)
 	}
-	ts := httptest.NewServer(newMCPHandler(shared, logger, token))
+	ts := httptest.NewServer(newMCPHandler(shared, logger, tokens))
 	t.Cleanup(ts.Close)
 	return ts, real
 }
 
-// connectHTTP opens one MCP client session against ts. Against the
-// stateless server a "session" is purely client-side bookkeeping: the
-// initialize response carries no Mcp-Session-Id (stateless never issues
-// one; the SDK client tolerates that), and every request is served by a
-// fresh per-request server over the ONE process-wide tools.Conn — which is
-// exactly the semantics TestHTTPProcessWideMarkers pins. The endpoint
-// carries the token in the path, as production clients must.
+// startMultiTokenHTTPTestServer is the list-form twin of
+// startHTTPTestServer: tokens are configured through tokensEnv (comma
+// join, exactly what an operator would write) and resolved by loadTokens,
+// so every multi-token test runs the same env-parse + per-token route/Conn
+// construction run() performs. tokenEnv is set to empty so a passing test
+// proves the list form works alone, not on top of the single var.
+func startMultiTokenHTTPTestServer(t *testing.T, tokens ...string) (*httptest.Server, string) {
+	t.Helper()
+	if len(tokens) < 2 {
+		t.Fatalf("multi-token harness wants >=2 tokens, got %v", tokens)
+	}
+	dir := t.TempDir()
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", dir, err)
+	}
+	t.Setenv(tokensEnv, strings.Join(tokens, ","))
+	t.Setenv(tokenEnv, "")
+	got, err := loadTokens()
+	if err != nil {
+		t.Fatalf("loadTokens: %v", err)
+	}
+	if !slices.Equal(got, tokens) {
+		t.Fatalf("loadTokens = %v, want %v", got, tokens)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	shared, err := tools.NewShared([]string{dir}, logger)
+	if err != nil {
+		t.Fatalf("tools.NewShared: %v", err)
+	}
+	ts := httptest.NewServer(newMCPHandler(shared, logger, got))
+	t.Cleanup(ts.Close)
+	return ts, real
+}
+
+// connectHTTP opens one MCP client session against ts at the shared
+// testToken endpoint — the single-token tests' convenience form.
 func connectHTTP(t *testing.T, ts *httptest.Server) *mcp.ClientSession {
+	t.Helper()
+	return connectHTTPToken(t, ts, testToken)
+}
+
+// connectHTTPToken opens one MCP client session against ts at the given
+// token's endpoint. Against the stateless server a "session" is purely
+// client-side bookkeeping: the initialize response carries no
+// Mcp-Session-Id (stateless never issues one; the SDK client tolerates
+// that), and every request is served by a fresh per-request server over
+// the token's dedicated tools.Conn — per-token marker scope (see
+// tools.Conn) with cross-request persistence within the token. The
+// endpoint carries the token in the path, as production clients must.
+func connectHTTPToken(t *testing.T, ts *httptest.Server, token string) *mcp.ClientSession {
 	t.Helper()
 	client := mcp.NewClient(&mcp.Implementation{Name: "http-test-client", Version: "1.0"}, nil)
 	cs, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
-		Endpoint: ts.URL + "/" + testToken + "/mcp",
+		Endpoint: ts.URL + "/" + token + "/mcp",
 	}, nil)
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
@@ -236,6 +288,203 @@ func TestHTTPProcessWideMarkers(t *testing.T) {
 	})
 	if !isErr || !strings.Contains(text, "has not been read in this session") {
 		t.Fatalf("write to never-read file: (isErr=%v) %q, want EUnreadWrite", isErr, text)
+	}
+}
+
+// TestHTTPWriteReadEditAcrossRequests pins same-token cross-request marker
+// persistence in its minimal full shape: write→read→edit as THREE separate
+// stateless requests under one token. Each request runs through its own
+// fresh per-request server; the edit only lands because the token's Conn
+// carries the write's and the read's markers across the request boundaries
+// (TestHTTPWriteReadE2E covers the write→read prefix; this adds the edit).
+func TestHTTPWriteReadEditAcrossRequests(t *testing.T) {
+	ts, dir := startHTTPTestServer(t)
+	cs := connectHTTP(t, ts)
+	path := filepath.Join(dir, "three-requests.txt")
+
+	if text, isErr := httpCallTool(t, cs, "write", map[string]any{
+		"file_path": path, "content": "one\ntwo\n",
+	}); isErr {
+		t.Fatalf("write: unexpected tool error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, cs, "read", map[string]any{"file_path": path}); isErr {
+		t.Fatalf("read: unexpected tool error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, cs, "edit", map[string]any{
+		"file_path": path, "old_string": "two", "new_string": "TWO",
+	}); isErr {
+		t.Fatalf("edit: unexpected tool error: %s", text)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "one\nTWO\n" {
+		t.Errorf("disk = %q, want the edit applied", got)
+	}
+}
+
+// TestHTTPMultiTokenRouting: every configured token gets a working endpoint
+// — the initialize handshake succeeds on each (connectHTTPToken performs
+// it) and each route answers a real tool call over its own Conn — and an
+// unknown token still dies in the plain mux 404: route existence is the
+// whole auth story, for every token equally.
+func TestHTTPMultiTokenRouting(t *testing.T) {
+	tokens := []string{"multi-token-a", "multi-token-b", "multi-token-c"}
+	ts, dir := startMultiTokenHTTPTestServer(t, tokens...)
+	if err := os.WriteFile(filepath.Join(dir, "probe.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tok := range tokens {
+		cs := connectHTTPToken(t, ts, tok)
+		if res := cs.InitializeResult(); res == nil {
+			t.Errorf("token %q: InitializeResult = nil after connect", tok)
+			continue
+		}
+		// A real read-only tool call through that token's route: glob over
+		// the temp dir must list the seeded file.
+		text, isErr := httpCallTool(t, cs, "glob", map[string]any{"pattern": "*", "path": dir})
+		if isErr || !strings.Contains(text, "probe.txt") {
+			t.Errorf("token %q: glob = (isErr=%v) %q, want probe.txt listed", tok, isErr, text)
+		}
+	}
+
+	// Unknown token: still the plain ServeMux 404, never an SDK answer.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, ts.URL+"/no-such-token/mcp", strings.NewReader(initRequestBody))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("unknown-token probe: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown token: status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestHTTPCrossTokenIsolation is the headline token-as-session test: two
+// tokens, two dedicated Conns, one file — the cross-client isolation the
+// stateless protocol removed, restored along the credential axis.
+// EUnreadWrite is per token (A's read does not authorize B's edit); ANY
+// writer stales every other token's marker because EStaleRead compares
+// against the file's CURRENT state (B's successful edit leaves A's marker
+// stale → A gets EStaleRead; an out-of-band disk write stales both); a
+// never-read file is EUnreadWrite for both tokens; each re-read re-arms
+// only that token.
+func TestHTTPCrossTokenIsolation(t *testing.T) {
+	const tokA, tokB = "iso-token-a", "iso-token-b"
+	ts, dir := startMultiTokenHTTPTestServer(t, tokA, tokB)
+	a := connectHTTPToken(t, ts, tokA)
+	b := connectHTTPToken(t, ts, tokB)
+	path := filepath.Join(dir, "cross.txt")
+	if err := os.WriteFile(path, []byte("v0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A reads F: the marker lands on token A's Conn only.
+	if text, isErr := httpCallTool(t, a, "read", map[string]any{"file_path": path}); isErr {
+		t.Fatalf("A read: unexpected error: %s", text)
+	}
+
+	// B's edit without a read of its own: EUnreadWrite — A's read does not
+	// authorize B (the exact call that SUCCEEDS under one shared Conn in
+	// TestHTTPProcessWideMarkers, fenced again now that markers are per
+	// token).
+	text, isErr := httpCallTool(t, b, "edit", map[string]any{
+		"file_path": path, "old_string": "v0", "new_string": "from B",
+	})
+	if !isErr || !strings.Contains(text, "has not been read in this session") {
+		t.Fatalf("B edit after A's read: (isErr=%v) %q, want EUnreadWrite", isErr, text)
+	}
+
+	// B reads F, then B's edit succeeds.
+	if text, isErr := httpCallTool(t, b, "read", map[string]any{"file_path": path}); isErr {
+		t.Fatalf("B read: unexpected error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, b, "edit", map[string]any{
+		"file_path": path, "old_string": "v0", "new_string": "from B",
+	}); isErr {
+		t.Fatalf("B edit after B's read: unexpected error: %s", text)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "from B\n" {
+		t.Fatalf("disk = %q, want B's edit applied", got)
+	}
+
+	// A's marker predates B's write: A's edit is EStaleRead — never a silent
+	// overwrite of what B just landed.
+	text, isErr = httpCallTool(t, a, "edit", map[string]any{
+		"file_path": path, "old_string": "from B", "new_string": "from A",
+	})
+	if !isErr || !strings.Contains(text, "file changed since last read") {
+		t.Fatalf("A edit after B's write: (isErr=%v) %q, want EStaleRead", isErr, text)
+	}
+
+	// Recovery for A: re-read (fresh marker on A's Conn), then edit.
+	if text, isErr := httpCallTool(t, a, "read", map[string]any{"file_path": path}); isErr {
+		t.Fatalf("A re-read: unexpected error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, a, "edit", map[string]any{
+		"file_path": path, "old_string": "from B", "new_string": "from A",
+	}); isErr {
+		t.Fatalf("A edit after re-read: unexpected error: %s", text)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "from A\n" {
+		t.Fatalf("disk = %q, want A's edit applied", got)
+	}
+
+	// A never-read existing file stays fenced off for BOTH tokens.
+	unseen := filepath.Join(dir, "unseen-cross.txt")
+	if err := os.WriteFile(unseen, []byte("never read\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, cs := range map[string]*mcp.ClientSession{"A": a, "B": b} {
+		text, isErr = httpCallTool(t, cs, "write", map[string]any{
+			"file_path": unseen, "content": "x\n",
+		})
+		if !isErr || !strings.Contains(text, "has not been read in this session") {
+			t.Errorf("token %s write to never-read file: (isErr=%v) %q, want EUnreadWrite", name, isErr, text)
+		}
+	}
+
+	// An out-of-band disk write (a host-side editor, anything but this
+	// process) stales BOTH tokens' markers: each Conn compares its own
+	// last-seen state against the moved file, so each must reject with
+	// EStaleRead rather than silently overwrite.
+	if err := os.WriteFile(path, []byte("out-of-band\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, cs := range map[string]*mcp.ClientSession{"A": a, "B": b} {
+		text, isErr = httpCallTool(t, cs, "edit", map[string]any{
+			"file_path": path, "old_string": "out-of-band", "new_string": "from " + name,
+		})
+		if !isErr || !strings.Contains(text, "file changed since last read") {
+			t.Errorf("token %s edit after out-of-band change: (isErr=%v) %q, want EStaleRead", name, isErr, text)
+		}
+	}
+	if got, _ := os.ReadFile(path); string(got) != "out-of-band\n" {
+		t.Errorf("disk = %q, want the out-of-band content untouched by the rejected edits", got)
+	}
+
+	// Until each re-reads: B first (its fresh marker arms its edit), then A
+	// (B's edit moved the file again, so A needs its own re-read).
+	if text, isErr := httpCallTool(t, b, "read", map[string]any{"file_path": path}); isErr {
+		t.Fatalf("B re-read: unexpected error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, b, "edit", map[string]any{
+		"file_path": path, "old_string": "out-of-band", "new_string": "from B again",
+	}); isErr {
+		t.Fatalf("B edit after re-read: unexpected error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, a, "read", map[string]any{"file_path": path}); isErr {
+		t.Fatalf("A re-read: unexpected error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, a, "edit", map[string]any{
+		"file_path": path, "old_string": "from B again", "new_string": "from A again",
+	}); isErr {
+		t.Fatalf("A edit after re-read: unexpected error: %s", text)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "from A again\n" {
+		t.Errorf("disk = %q, want A's edit after both tokens re-read", got)
 	}
 }
 
