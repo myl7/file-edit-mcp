@@ -13,29 +13,26 @@
   路径即凭证，token 来自环境变量 `FILE_EDIT_MCP_TOKEN`（http 模式必填，缺省/空值或字符集非法
   启动即报错；校验 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`，先于路由 pattern 构造，保证 token 无法
   注入 ServeMux 语法）。其余路径（含旧 `/mcp`、错误 token、`/`）一律 mux 404，不达 MCP handler；
-  token 绝不写 stderr 日志（endpoint 以 `/<token>/mcp` 占位符记录）。**每个 HTTP 连接一个独立
-  `*mcp.Server` 实例**（SDK StreamableHTTPHandler 的 GetServer 回调），即会话状态按连接隔离，
-  与原来「每会话一进程」语义等价。server 必须保持 stateful（按会话 read-before-write 标记即
-  核心安全特性，`Stateless=true` 会毁掉它们），而 SDK 对 `MCP-Protocol-Version: 2026-07-28`
-  （SEP-2567 无会话协议，新版客户端 discover 后会带上）在 stateful server 上直接 400，故在
-  token 路由之内、SDK handler 之外加一层改写中间件：请求头版本不在本 server 实际支持的版本集
-  （2024-11-05、2025-03-26、2025-06-18、2025-11-25）内即改写为 initialize 协商上限
-  2025-11-25（未知/未来版本同样改写，保持向前兼容）；改写后的 batch POST 仍会按 ≥2025-06-18
-  的规范规则被 SDK 拒绝，属规范行为，刻意不绕过。单条 `server/discover` 请求（2026-07-28
-  客户端握手的探测请求，ChatGPT connector 即此形态：头与 `params._meta` 同带 2026-07-28）由
-  token 路由内最外层的新中间件直接作答，`supportedVersions` 只列上述四个 stateful 版本、刻意
-  不含 2026-07-28——按官方协议文档，discover 应答不含客户端版本即令其回退到 legacy initialize
-  握手（本 server 服务良好），而 stateful SDK handler 自身给不出可用 discover 应答；谎报
-  2026-07-28 只会把客户端推进本 server 必须拒绝的 sessionless 请求。带 `_meta` 版本的请求则
-  由改写中间件成对降级：消息 `params._meta["io.modelcontextprotocol/protocolVersion"]` 版本在
-  支持集外即删除该键（batch 数组逐条处理，其余 `_meta` 键保留），并连带移除集外的
-  `MCP-Protocol-Version` 头——两者一起降为 legacy 形态，彻底消除头/`_meta` 不一致触发的
-  -32020（SDK 对任何携带 `_meta` 版本的非 discover 消息在 stateful 上一律 400，故只能删键而非
-  改值）；batch 内的 discover 元素不拦截，由 SDK 以 in-band -32601 应答、其余消息正常处理。
-  **不再前置 nginx basic auth**：token 即唯一鉴权，轮换 = 改
-  环境变量 + 重建容器。
+  token 绝不写 stderr 日志（endpoint 以 `/<token>/mcp` 占位符记录）。token-path 鉴权与 keepalive
+  不因 transport 改版而变。HTTP transport 为 **stateless**（SDK StreamableHTTPHandler
+  `Stateless: true`；2026-09 实测）：ChatGPT custom connector 创建强制要求 2026-07-28 无会话协议
+  （SEP-2567），其客户端（openai-mcp/1.0.0）discover-first 且**没有**回退到 legacy initialize
+  握手的实现，而 stateful server 对这类流量一律 400。stateless 下 SDK 原生同时服务两端：
+  `server/discover` 自带完整正确应答（含 instructions、advertise 2026-07-28 及各 legacy 版本），
+  ≥2026-07-28 请求的 SEP-2243 头（`Mcp-Method`/`Mcp-Name`）由 SDK 强制校验，legacy
+  initialize-then-call 流量靠每请求合成的会话状态照常工作——故此前为 stateful server 手写的
+  discover 应答与版本改写中间件全部移除（git 历史留档）。stateless 无会话：GET/DELETE 一律
+  405、响应不设 `Mcp-Session-Id`，连接开/关日志无从谈起（已删），审计面是前置 nginx 的
+  access log。**每请求一个 `*mcp.Server`**（GetServer 回调；SDK 文档明示可每次返回新实例），
+  六工具注册在 **HTTP handler 生命周期唯一的 `tools.Conn`** 上——per-request Conn 会令 read
+  标记随请求重置、每次写都 EUnreadWrite；唯一 Conn 使标记**进程级**（已批准的语义变更，§7）：
+  EUnreadWrite = 本进程从未读过该文件，EStaleRead = 自本进程最后一次读/写后文件被进程外改动；
+  跨连接隔离刻意取消——无会话协议没有会话可隔离，单用户单 token 部署下无实际影响，stale-read
+  栅栏与同路径写串行化（锁表同样进程级）不变。**不再前置 nginx basic auth**：token 即唯一鉴权，
+  轮换 = 改环境变量 + 重建容器。
 - server instructions（MCP 的 AGENTS.md 等价物）：initialize result 的 `instructions` 字段在
-  每次构造 server（stdio 与每个 HTTP 会话）时设置。默认文本仅一句话：插值实际允许目录的根
+  每次构造 server（stdio 一次、HTTP 每请求一次）时设置，文本在 handler 构造时解析一次共享，
+  stateless discover 应答（SDK 原生）发送同一文本。默认文本仅一句话：插值实际允许目录的根
   路径清单——工具语义一律只住在工具描述里，不在这里重复（该文本每会话注入模型上下文，重复
   schema 已有事实即纯 token 成本加漂移风险；允许根路径是 schema 无法得知的唯一信息缺口）；
   环境变量 `FILE_EDIT_MCP_INSTRUCTIONS` 非空则原样覆盖（部署特定语境走此覆盖）。
@@ -199,8 +196,10 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 
 ## 7. 会话与并发
 
-- 「会话」= 一个 MCP 客户端连接的生命周期。stdio 模式一进程一连接；HTTP 模式一连接一个
-  server 实例（见 §0）。session 状态（已读跟踪、路径锁表）随之按连接隔离。
+- 「会话」= 一个 MCP 客户端连接的生命周期——该等式现仅对 stdio 成立（一进程一连接）。HTTP
+  模式 stateless（§0）：每请求一个 server 实例，全部注册在 handler 生命周期唯一的 Conn 上，
+  已读跟踪与路径锁表因此为**进程级**（已批准的语义变更）：EUnreadWrite/EStaleRead 按进程
+  判定，跨连接隔离取消；stale-read 栅栏与同路径写串行化不变。
 - `internal/session`：`map[resolvedPath]marker{size, mtime}`（read 成功时记录），
   外加 `map[resolvedPath]*sync.Mutex` 做同路径写串行化。全程持锁访问。
 - MCP handler 可能并发调用；所有共享状态经 session 包的锁。

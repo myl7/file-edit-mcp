@@ -83,21 +83,30 @@ func NewShared(allowedDirs []string, log *slog.Logger) (*Shared, error) {
 	return s, nil
 }
 
-// Conn is one MCP connection's slice of the server: the per-connection
-// session state (§7) layered over the process-wide Shared state. Create one
-// per connection with Shared.NewConn — stdio builds exactly one, the HTTP
-// transport's GetServer callback builds one per StreamableHTTP session, so
-// session semantics match the old one-process-per-connection form.
+// Conn is the read-marker and per-path-lock state (§7) layered over the
+// process-wide Shared state. Scope is per transport (§0): stdio builds
+// exactly one — one process is one session anyway — and the stateless HTTP
+// transport builds ONE for the lifetime of the HTTP handler, registering it
+// on every per-request *mcp.Server its StreamableHTTP GetServer callback
+// constructs. HTTP markers are therefore PROCESS-wide by design (the
+// approved semantics change that came with the stateless 2026-07-28
+// protocol, SEP-2567): EUnreadWrite means the file was not read anywhere in
+// this process, EStaleRead means it changed since the last read or write
+// this process saw. Cross-connection marker isolation is deliberately gone:
+// the sessionless handshake ChatGPT connectors speak (discover-first, and
+// openai-mcp/1.0.0 implements NO fallback to the legacy initialize
+// handshake) has no session to isolate along, and the deployment is
+// single-user (token-path auth = one bearer of the one token). The
+// stale-read fence still holds unchanged: every write re-stats the file and
+// rejects with EStaleRead whenever size or mtime moved since the process's
+// last-seen state, so an out-of-band writer can only cause a rejected edit,
+// never a silent overwrite; same-path writes stay serialized because the
+// per-path lock table is process-wide now too.
 //
-// Cross-connection concurrency trade-off, deliberate (§7): the per-path
-// write lock and the read markers are per Conn, so two connections editing
-// the same file are NOT serialized against each other. The safety net is
-// the stale-read fence: every write re-stats the file and rejects with
-// EStaleRead whenever size or mtime moved since the connection's last read,
-// so a concurrent cross-connection writer can only cause a rejected edit,
-// never a silent overwrite. Serializing across connections would need a
-// process-wide lock table, which would reintroduce coupling between
-// independent client sessions the architecture explicitly isolates.
+// Concurrent use by overlapping requests is safe: Session guards markers
+// and locks behind one mutex (verified with -race), and Register is pure
+// wiring (see below), so any number of per-request servers may share one
+// Conn simultaneously.
 type Conn struct {
 	// *Shared embeds the process-level Guard/Retry/Roots/Log.
 	*Shared
@@ -106,14 +115,25 @@ type Conn struct {
 }
 
 // NewConn returns a fresh connection state over s: an empty session, sharing
-// s's Guard, Root pool, and Retrier. Safe to call from concurrent GetServer
-// callbacks.
+// s's Guard, Root pool, and Retrier. stdio calls it once per process; the
+// stateless HTTP transport calls it once for the HTTP handler's lifetime and
+// registers the result on every per-request server (see Conn for the
+// process-wide marker scope that follows). Safe to call concurrently.
 func (s *Shared) NewConn() *Conn {
 	return &Conn{Shared: s, Sess: session.New()}
 }
 
 // Register adds all six tools to srv: read/write/edit/multi_edit (files
 // read.go/write.go/edit.go) and glob/grep (files glob.go/grep.go).
+//
+// Pure wiring: it hands six bound handler method values to mcp.AddTool and
+// keeps no state on the Conn, so registering one Conn on any number of
+// servers — the stateless HTTP handler does exactly that, once per
+// per-request server — is safe, concurrently callable, and idempotent
+// (Server.AddTool replaces a same-name tool rather than duplicating it).
+// The marker/lock state the handlers close over lives in the Conn, shared
+// by every server the Conn is registered on; see the Conn doc for that
+// scope.
 func (s *Conn) Register(srv *mcp.Server) {
 	mcp.AddTool(srv, &mcp.Tool{Name: "read", Description: toolDescRead}, s.Read)
 	mcp.AddTool(srv, &mcp.Tool{Name: "write", Description: toolDescWrite}, s.Write)

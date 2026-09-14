@@ -1,11 +1,11 @@
 # file-edit-mcp
 
-An MCP (Model Context Protocol) server exposing six file tools — `read`, `write`, `edit`, `multi_edit`, `glob`, `grep` — strictly scoped to the directories given via `--allow`. Mutating tools enforce read-before-write within a session, and edits are rejected when the file changed since it was last read. There are no shell, process, network, clipboard, or screenshot tools. Two transports: stdio (local, one process per client connection) and streamable HTTP (resident server).
+An MCP (Model Context Protocol) server exposing six file tools — `read`, `write`, `edit`, `multi_edit`, `glob`, `grep` — strictly scoped to the directories given via `--allow`. Mutating tools enforce read-before-write, and edits are rejected when the file changed since it was last read. There are no shell, process, network, clipboard, or screenshot tools. Two transports: stdio (local, one process per client connection) and streamable HTTP (resident, stateless — it speaks the 2026-07-28 MCP protocol natively, the form ChatGPT custom connectors require, alongside the legacy protocol versions for older clients).
 
 ## Security model
 
 - **Root scoping.** Only absolute paths under the `--allow` roots are served. Validation is a pipeline: clean/abs normalization, prefix comparison against the allowed roots, then a realpath pass with a second prefix comparison; file operations go through `os.Root` (openat semantics), so `..` traversal and symlink swaps cannot escape a validated root.
-- **Read-before-write.** `write`/`edit`/`multi_edit` on an existing file the session has not read are rejected (`EUnreadWrite`); `edit`/`multi_edit` additionally re-check size/mtime at write time and reject stale reads (`EStaleRead`), so a concurrent writer can cause a rejected edit but never a silent overwrite.
+- **Read-before-write.** `write`/`edit`/`multi_edit` on an existing file that has not been read are rejected (`EUnreadWrite`); `edit`/`multi_edit` additionally re-check size/mtime at write time and reject stale reads (`EStaleRead`), so a concurrent writer can cause a rejected edit but never a silent overwrite. Over stdio the marker scope is the process (one connection); over HTTP it is also the process — one shared marker set for every request of every client — because the stateless transport ChatGPT connectors require has no sessions to isolate along, and the deployment model is a single user behind a single token.
 - **Atomic writes.** Content lands via a same-directory temp file plus rename; a failed write leaves the original file untouched.
 - **No execution surface.** The only subprocess is `rg` behind `grep`, with arguments built by the server from typed fields — no shell, no user-controlled command line.
 - **Token-path auth (HTTP).** The MCP endpoint is `/{token}/mcp`; the token comes from `FILE_EDIT_MCP_TOKEN`. Every other path — including wrong tokens — is a plain 404 that never reaches the MCP handler, and the token never appears in logs. A leaked token is full access to the allowed roots: bind the port to loopback or an internal interface only.
@@ -38,7 +38,7 @@ Client configuration:
 FILE_EDIT_MCP_TOKEN=secret-token ./file-edit-mcp --transport http --addr 127.0.0.1:8080 --allow /data
 ```
 
-The MCP endpoint is then `http://127.0.0.1:8080/secret-token/mcp`. Client configuration (URL form):
+The MCP endpoint is then `http://127.0.0.1:8080/secret-token/mcp`. The HTTP transport is stateless streamable HTTP: every request is self-contained (no sessions, no `Mcp-Session-Id`), the `server/discover` handshake of the 2026-07-28 MCP protocol — what ChatGPT custom connectors send — is answered natively, and clients speaking the older initialize-handshake protocol versions are served just the same. Client configuration (URL form):
 
 ```json
 {

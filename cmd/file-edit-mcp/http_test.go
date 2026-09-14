@@ -1,21 +1,20 @@
-// HTTP transport tests (ARCHITECTURE §0/§9): the real StreamableHTTP wiring
-// from main.go served by httptest and driven by the SDK's StreamableHTTP
-// client — one write→read E2E round trip, the per-connection session
-// isolation (a read on connection A must not unlock an edit on connection
-// B; a cross-connection concurrent write must surface as EStaleRead on the
-// connection whose marker went stale), the token-path routing (everything
-// but /{token}/mcp is a mux 404), the initialize-result instructions, the
-// MCP-Protocol-Version downgrade for the sessionless-protocol header, the
-// header/_meta sync rewrite that keeps 2026-07-28 clients (the ChatGPT
-// connector) past the SDK's -32020 mismatch, and the direct server/discover
-// responder that steers them back onto the legacy initialize handshake.
+// HTTP transport tests (ARCHITECTURE §0/§9): the real stateless
+// StreamableHTTP wiring from main.go served by httptest and driven two
+// ways — by the SDK's StreamableHTTP client (initialize handshake, one
+// write→read E2E round trip, instructions coverage) and by raw POSTs in the
+// exact shapes the 2026-07-28 protocol (SEP-2567, the stateless handshake
+// ChatGPT custom connectors require) prescribes: server/discover and
+// header-stamped tools/call. Plus the process-wide marker semantics (one
+// read anywhere in the process unlocks writes from any client session; a
+// change the process never saw is EStaleRead; a never-read file stays
+// EUnreadWrite) and the token-path routing (everything but /{token}/mcp is
+// a mux 404).
 
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -35,6 +34,22 @@ import (
 // testToken is the fixed token the HTTP tests configure via tokenEnv — the
 // same loadToken+newMCPHandler path run() takes, never a hand-built mux.
 const testToken = "test-token-1"
+
+// The wire headers of the >= 2026-07-28 stateless protocol (SEP-2243): the
+// protocol-version header every request carries, and the Mcp-Method /
+// Mcp-Name headers the SDK enforces on this endpoint for 2026-07-28
+// traffic. The SDK client behind connectHTTP stamps its own; the raw-shape
+// tests below must control the exact bytes, so the names live here.
+const (
+	protoVersionHeader = "MCP-Protocol-Version"
+	methodHeader       = "Mcp-Method"
+	nameHeader         = "Mcp-Name"
+)
+
+// statelessProtocolVersion is the sessionless protocol date (SEP-2567) the
+// stateless handler serves natively — the version ChatGPT connectors
+// discover with and never fall back from.
+const statelessProtocolVersion = "2026-07-28"
 
 // startHTTPTestServer boots the production HTTP assembly (loadToken +
 // newMCPHandler) over one fresh temp allowed dir, exactly as run() and
@@ -61,9 +76,13 @@ func startHTTPTestServer(t *testing.T) (*httptest.Server, string) {
 	return ts, real
 }
 
-// connectHTTP opens one MCP client session against ts — one call = one
-// StreamableHTTP session = one tools.Conn, the §0 isolation unit. The
-// endpoint carries the token in the path, as production clients must.
+// connectHTTP opens one MCP client session against ts. Against the
+// stateless server a "session" is purely client-side bookkeeping: the
+// initialize response carries no Mcp-Session-Id (stateless never issues
+// one; the SDK client tolerates that), and every request is served by a
+// fresh per-request server over the ONE process-wide tools.Conn — which is
+// exactly the semantics TestHTTPProcessWideMarkers pins. The endpoint
+// carries the token in the path, as production clients must.
 func connectHTTP(t *testing.T, ts *httptest.Server) *mcp.ClientSession {
 	t.Helper()
 	client := mcp.NewClient(&mcp.Implementation{Name: "http-test-client", Version: "1.0"}, nil)
@@ -96,8 +115,11 @@ func httpCallTool(t *testing.T, cs *mcp.ClientSession, name string, args map[str
 	return text, res.IsError
 }
 
-// TestHTTPWriteReadE2E: one session, write a new file then read it back —
-// the write→read round trip over the full HTTP stack.
+// TestHTTPWriteReadE2E: one client session, write a new file then read it
+// back. Under stateless serving these are two independent requests through
+// two fresh per-request servers — the round trip works only because the
+// process-wide Conn carries the write's mark-known across them (better than
+// the old per-session state ever needed to).
 func TestHTTPWriteReadE2E(t *testing.T) {
 	ts, dir := startHTTPTestServer(t)
 	cs := connectHTTP(t, ts)
@@ -141,11 +163,16 @@ func TestHTTPWriteReadE2E(t *testing.T) {
 	}
 }
 
-// TestHTTPSessionIsolation: connection A's read does not unlock connection
-// B's edit (per-connection session markers); after B reads and edits, A's
-// stale marker rejects A's next edit as EStaleRead — the cross-connection
-// safety net for the deliberately unserialized same-file writes (§7).
-func TestHTTPSessionIsolation(t *testing.T) {
+// TestHTTPProcessWideMarkers pins the approved marker semantics of the
+// stateless transport: the read-before-write markers live on ONE Conn for
+// the whole process, so client-session boundaries no longer isolate them.
+// A's read unlocks B's edit (EUnreadWrite is now "not read anywhere in this
+// process"); a change the process never saw (an out-of-band disk write —
+// anything this process wrote refreshed the marker, because then the
+// content is known) is still EStaleRead; a file no request ever read stays
+// EUnreadWrite. The old TestHTTPSessionIsolation asserted the opposite
+// first arm; that isolation is deliberately gone (see tools.Conn).
+func TestHTTPProcessWideMarkers(t *testing.T) {
 	ts, dir := startHTTPTestServer(t)
 	a := connectHTTP(t, ts)
 	b := connectHTTP(t, ts)
@@ -154,39 +181,61 @@ func TestHTTPSessionIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A reads; the marker lands in A's session only.
+	// A reads; the marker lands on the process-wide Conn.
 	if text, isErr := httpCallTool(t, a, "read", map[string]any{"file_path": path}); isErr {
 		t.Fatalf("A read: unexpected error: %s", text)
 	}
 
-	// B edits without having read: EUnreadWrite — A's read must not leak.
-	text, isErr := httpCallTool(t, b, "edit", map[string]any{
-		"file_path": path, "old_string": "v0", "new_string": "from B",
-	})
-	if !isErr || !strings.Contains(text, "has not been read in this session") {
-		t.Fatalf("B edit before B read: (isErr=%v) %q, want EUnreadWrite", isErr, text)
-	}
-
-	// B reads, then B's edit succeeds on B's own marker.
-	if text, isErr := httpCallTool(t, b, "read", map[string]any{"file_path": path}); isErr {
-		t.Fatalf("B read: unexpected error: %s", text)
-	}
+	// B edits without any read of its own: SUCCEEDS — A's read is process-
+	// wide. (This exact call was EUnreadWrite under per-session markers.)
 	if text, isErr := httpCallTool(t, b, "edit", map[string]any{
 		"file_path": path, "old_string": "v0", "new_string": "from B",
 	}); isErr {
-		t.Fatalf("B edit after B read: unexpected error: %s", text)
-	}
-
-	// A's marker is now stale (B's write moved size/mtime): A's edit is
-	// rejected as EStaleRead instead of silently overwriting B's content.
-	text, isErr = httpCallTool(t, a, "edit", map[string]any{
-		"file_path": path, "old_string": "from B", "new_string": "from A",
-	})
-	if !isErr || !strings.Contains(text, "file changed since last read") {
-		t.Fatalf("A edit after B's write: (isErr=%v) %q, want EStaleRead", isErr, text)
+		t.Fatalf("B edit after A's read: unexpected error: %s", text)
 	}
 	if got, _ := os.ReadFile(path); string(got) != "from B\n" {
-		t.Errorf("disk = %q, want B's content untouched by A's rejected edit", got)
+		t.Fatalf("disk = %q, want B's edit applied", got)
+	}
+
+	// An out-of-band change (a host-side editor, anything but this process):
+	// no request of ours saw it, so the process marker is stale and A's edit
+	// is rejected EStaleRead instead of silently overwriting it.
+	if err := os.WriteFile(path, []byte("out-of-band\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	text, isErr := httpCallTool(t, a, "edit", map[string]any{
+		"file_path": path, "old_string": "out-of-band", "new_string": "from A",
+	})
+	if !isErr || !strings.Contains(text, "file changed since last read") {
+		t.Fatalf("A edit after out-of-band change: (isErr=%v) %q, want EStaleRead", isErr, text)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "out-of-band\n" {
+		t.Errorf("disk = %q, want the out-of-band content untouched by the rejected edit", got)
+	}
+
+	// Recovery: A re-reads (fresh process marker), and A's edit now lands.
+	if text, isErr := httpCallTool(t, a, "read", map[string]any{"file_path": path}); isErr {
+		t.Fatalf("A re-read: unexpected error: %s", text)
+	}
+	if text, isErr := httpCallTool(t, a, "edit", map[string]any{
+		"file_path": path, "old_string": "out-of-band", "new_string": "from A",
+	}); isErr {
+		t.Fatalf("A edit after re-read: unexpected error: %s", text)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "from A\n" {
+		t.Errorf("disk = %q, want A's edit after the re-read", got)
+	}
+
+	// A never-read existing file stays fenced off for everyone: EUnreadWrite.
+	unseen := filepath.Join(dir, "unseen.txt")
+	if err := os.WriteFile(unseen, []byte("never read\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	text, isErr = httpCallTool(t, b, "write", map[string]any{
+		"file_path": unseen, "content": "x\n",
+	})
+	if !isErr || !strings.Contains(text, "has not been read in this session") {
+		t.Fatalf("write to never-read file: (isErr=%v) %q, want EUnreadWrite", isErr, text)
 	}
 }
 
@@ -271,22 +320,115 @@ func TestHTTPInstructionsOverride(t *testing.T) {
 	}
 }
 
-// initializedNotificationBody and toolsListRequestBody extend the raw-probe
-// bodies below the handshake: the initialized notification (HTTP 202, no
-// result) and a tools/list call whose answer must come back as an SSE
-// result frame.
-const (
-	initializedNotificationBody = `{"jsonrpc":"2.0","method":"notifications/initialized"}`
-	toolsListRequestBody        = `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
-)
+// statelessDiscoverBody is the exact discover request shape verified
+// against the stateless server (the ChatGPT connector's probe): a single
+// server/discover POST whose params._meta carries the protocol version and
+// client capabilities, with MCP-Protocol-Version and Mcp-Method headers
+// stamped alongside (set by httpMCPPost below).
+const statelessDiscoverBody = `{"jsonrpc":"2.0","id":41,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
 
-// httpMCPPost issues one MCP POST against endpoint with the headers a real
-// client sends: JSON content type, the dual Accept, the session id once the
-// handshake produced one, and protoVersion as MCP-Protocol-Version ("" =
-// omit the header — the pre-handshake shape clients use for initialize).
-// Raw requests on purpose: the SDK client transport stamps its own
-// negotiated header, which is exactly the input these tests must control.
-func httpMCPPost(t *testing.T, endpoint, body, sessionID, protoVersion string) *http.Response {
+// TestHTTPDiscoverStateless: the stateless SDK handler answers
+// server/discover natively — full correct shape, no middleware of ours —
+// advertising 2026-07-28 (the version that steers ChatGPT connectors onto
+// the sessionless protocol instead of into a legacy-initialize fallback
+// their client does not implement) and the same instructions text
+// initialize sends.
+func TestHTTPDiscoverStateless(t *testing.T) {
+	ts, dir := startHTTPTestServer(t)
+	endpoint := ts.URL + "/" + testToken + "/mcp"
+
+	resp := httpMCPPost(t, endpoint, statelessDiscoverBody, map[string]string{
+		protoVersionHeader: statelessProtocolVersion,
+		methodHeader:       "server/discover",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("discover: status = %d, want 200", resp.StatusCode)
+	}
+	payload := lastSSEData(t, resp)
+
+	var frame struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Result  struct {
+			SupportedVersions []string `json:"supportedVersions"`
+			Instructions      string   `json:"instructions"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+		t.Fatalf("discover: decode payload: %v\n%s", err, payload)
+	}
+	if frame.JSONRPC != "2.0" || frame.ID != 41 {
+		t.Errorf("envelope = jsonrpc %q id %d, want 2.0 echoing id 41", frame.JSONRPC, frame.ID)
+	}
+	if !slices.Contains(frame.Result.SupportedVersions, statelessProtocolVersion) {
+		t.Errorf("supportedVersions = %v, want it to offer 2026-07-28 (the stateless handshake ChatGPT connectors need):\n%s", frame.Result.SupportedVersions, payload)
+	}
+	if !strings.Contains(frame.Result.Instructions, "under: "+dir) {
+		t.Errorf("instructions do not name the allowed root %q:\n%s", dir, frame.Result.Instructions)
+	}
+}
+
+// TestHTTPStatelessToolsCallHeaders pins the header-enforced tools/call
+// flow a 2026-07-28 client uses (SEP-2243): Mcp-Method + Mcp-Name headers
+// beside the _meta version, answered by a real tool result. The second arm
+// pins the enforcement itself on this endpoint: the same request WITHOUT
+// Mcp-Name dies with HTTP 400 (SDK CodeHeaderMismatch), which is exactly
+// the contract the header-carrying clients rely on.
+func TestHTTPStatelessToolsCallHeaders(t *testing.T) {
+	ts, dir := startHTTPTestServer(t)
+	endpoint := ts.URL + "/" + testToken + "/mcp"
+	if err := os.WriteFile(filepath.Join(dir, "marker.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// glob "*" over the temp dir: echo-style, read-only, and its result must
+	// name the seeded file.
+	body := `{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"glob","arguments":{"pattern":"*","path":` + jsonQuote(dir) + `}}}`
+	resp := httpMCPPost(t, endpoint, body, map[string]string{
+		protoVersionHeader: statelessProtocolVersion,
+		methodHeader:       "tools/call",
+		nameHeader:         "glob",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("tools/call glob: status = %d, want 200", resp.StatusCode)
+	}
+	payload := lastSSEData(t, resp)
+	if !strings.Contains(payload, "marker.txt") {
+		t.Errorf("glob result does not list marker.txt:\n%s", payload)
+	}
+	var frame struct {
+		ID     int `json:"id"`
+		Result struct {
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+		t.Fatalf("tools/call: decode payload: %v\n%s", err, payload)
+	}
+	if frame.ID != 42 || frame.Result.IsError {
+		t.Errorf("tools/call frame = id %d isError %v, want id 42 with a clean result:\n%s", frame.ID, frame.Result.IsError, payload)
+	}
+
+	// Same request minus Mcp-Name: the SDK must refuse it at the HTTP level.
+	resp = httpMCPPost(t, endpoint, body, map[string]string{
+		protoVersionHeader: statelessProtocolVersion,
+		methodHeader:       "tools/call",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("tools/call without Mcp-Name: status = %d, want 400 (header enforcement)", resp.StatusCode)
+	}
+}
+
+// httpMCPPost issues one MCP POST against endpoint with the headers every
+// raw test needs (JSON content type, the dual Accept the stateless handler
+// requires) plus hdr for the per-request extras (protocol-version and
+// SEP-2243 method/name headers). Raw requests on purpose: the SDK client
+// transport stamps its own negotiated headers, which is exactly the input
+// these tests must control.
+func httpMCPPost(t *testing.T, endpoint, body string, hdr map[string]string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {
@@ -294,11 +436,8 @@ func httpMCPPost(t *testing.T, endpoint, body, sessionID, protoVersion string) *
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if sessionID != "" {
-		req.Header.Set("Mcp-Session-Id", sessionID)
-	}
-	if protoVersion != "" {
-		req.Header.Set(mcpProtocolVersionHeader, protoVersion)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -307,39 +446,14 @@ func httpMCPPost(t *testing.T, endpoint, body, sessionID, protoVersion string) *
 	return resp
 }
 
-// openRawSession runs the initialize POST (carrying protoVersion as the
-// MCP-Protocol-Version header, "" = none) and returns the new session id.
-// The raw-handshake counterpart of connectHTTP's SDK-client path.
-func openRawSession(t *testing.T, endpoint, protoVersion string) string {
+// lastSSEData reads an SSE response body and returns the last data-frame
+// payload: the answer frame for a single-request POST (any earlier frames
+// would be notification noise, which a plain request never produces here).
+func lastSSEData(t *testing.T, resp *http.Response) string {
 	t.Helper()
-	resp := httpMCPPost(t, endpoint, initRequestBody, "", protoVersion)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("initialize: status = %d, want 200", resp.StatusCode)
-	}
-	sessionID := resp.Header.Get("Mcp-Session-Id")
-	if sessionID == "" {
-		t.Fatal("initialize: no Mcp-Session-Id on the response")
-	}
-	// Drain the InitializeResult SSE frame so the stream completes before
-	// the follow-ups (the SDK closes it once the result is delivered).
-	_, _ = io.ReadAll(resp.Body)
-	return sessionID
-}
-
-// decodeToolsListResponse asserts resp is a 200 SSE answer to a tools/list
-// call and returns the tool names from its result frame. The answer frame
-// is the last data payload (any earlier frames are priming/notification
-// noise, none of which a plain tools/list produces today).
-func decodeToolsListResponse(t *testing.T, resp *http.Response) []string {
-	t.Helper()
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("tools/list: status = %d, want 200", resp.StatusCode)
-	}
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("tools/list: read body: %v", err)
+		t.Fatalf("read body: %v", err)
 	}
 	var last string
 	for _, line := range strings.Split(string(b), "\n") {
@@ -348,394 +462,17 @@ func decodeToolsListResponse(t *testing.T, resp *http.Response) []string {
 		}
 	}
 	if last == "" {
-		t.Fatalf("tools/list: no SSE data frame in response:\n%s", b)
+		t.Fatalf("no SSE data frame in response:\n%s", b)
 	}
-	var frame struct {
-		ID     int `json:"id"`
-		Result struct {
-			Tools []struct {
-				Name string `json:"name"`
-			} `json:"tools"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(last), &frame); err != nil {
-		t.Fatalf("tools/list: decode frame: %v\n%s", err, last)
-	}
-	if frame.ID != 2 {
-		t.Errorf("tools/list frame id = %d, want 2 (the request id)", frame.ID)
-	}
-	names := make([]string, len(frame.Result.Tools))
-	for i, tool := range frame.Result.Tools {
-		names[i] = tool.Name
-	}
-	return names
+	return last
 }
 
-// wantToolNames is the full §0-§2 tool set tools/list must advertise, in
-// the name order the SDK returns them (sorted).
-var wantToolNames = []string{"edit", "glob", "grep", "multi_edit", "read", "write"}
-
-// TestHTTPProtocolVersionRewriteChain: a client that upgrades to the
-// sessionless 2026-07-28 header after initialize (the discover flow
-// advertises the new protocol and modern clients follow — the ChatGPT web
-// connector is the observed one) must still get a working session.
-// initialize goes out WITHOUT the header, as clients send it; then
-// notifications/initialized and tools/list each carry
-// MCP-Protocol-Version: 2026-07-28, which versionRewrite downgrades to the
-// stateful set before the SDK handler parses anything. Without the rewrite
-// both follow-ups die in the SDK's 400 "protocol version ... is only
-// supported on stateless HTTP servers" (verified against go-sdk v1.7.0,
-// mcp/streamable.go serveStatefulPOST) and the connector creation fails.
-func TestHTTPProtocolVersionRewriteChain(t *testing.T) {
-	ts, _ := startHTTPTestServer(t)
-	endpoint := ts.URL + "/" + testToken + "/mcp"
-
-	sessionID := openRawSession(t, endpoint, "")
-
-	// notifications/initialized WITH the sessionless header: spec answer is
-	// 202 Accepted, reachable only through the rewrite.
-	resp := httpMCPPost(t, endpoint, initializedNotificationBody, sessionID, "2026-07-28")
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("notifications/initialized: status = %d, want 202", resp.StatusCode)
-	}
-
-	// tools/list with the same header: a result must arrive, not a 400 —
-	// and it must be the full tool set.
-	resp = httpMCPPost(t, endpoint, toolsListRequestBody, sessionID, "2026-07-28")
-	if names := decodeToolsListResponse(t, resp); !slices.Equal(names, wantToolNames) {
-		t.Errorf("tools/list tools = %v, want %v", names, wantToolNames)
-	}
-}
-
-// TestHTTPAcceptedProtocolVersionChain: an accepted version passes through
-// versionRewrite untouched — the full chain works when the client stamps
-// the explicit 2025-06-18 header on every request, initialize included.
-// Complements the rewrite test: the middleware must rewrite ONLY what a
-// stateful server cannot answer (an SDK-negotiated header is a no-op pass
-// through the middleware, pinned directly below).
-func TestHTTPAcceptedProtocolVersionChain(t *testing.T) {
-	// Middleware-level pin: an accepted version reaches the inner handler
-	// verbatim, byte for byte.
-	var got string
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get(mcpProtocolVersionHeader)
-	})
-	req := httptest.NewRequest(http.MethodPost, "/"+testToken+"/mcp", nil)
-	req.Header.Set(mcpProtocolVersionHeader, "2025-06-18")
-	versionRewrite(inner).ServeHTTP(httptest.NewRecorder(), req)
-	if got != "2025-06-18" {
-		t.Errorf("inner handler saw %q, want the accepted 2025-06-18 verbatim", got)
-	}
-
-	ts, _ := startHTTPTestServer(t)
-	endpoint := ts.URL + "/" + testToken + "/mcp"
-
-	sessionID := openRawSession(t, endpoint, "2025-06-18")
-
-	resp := httpMCPPost(t, endpoint, initializedNotificationBody, sessionID, "2025-06-18")
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("notifications/initialized: status = %d, want 202", resp.StatusCode)
-	}
-
-	resp = httpMCPPost(t, endpoint, toolsListRequestBody, sessionID, "2025-06-18")
-	if names := decodeToolsListResponse(t, resp); !slices.Equal(names, wantToolNames) {
-		t.Errorf("tools/list tools = %v, want %v", names, wantToolNames)
-	}
-}
-
-// TestRewriteProtocolVersion pins the downgrade decision table: the four
-// stateful versions and the empty header pass through verbatim; the
-// sessionless 2026-07-28 and anything unknown/future collapse to
-// "2025-11-25", the initialize-negotiation cap. No HTTP involved — the
-// table is the contract the two chain tests above exercise end to end.
-func TestRewriteProtocolVersion(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"", ""}, // pre-handshake / header omitted: SDK treats as version unknown
-		{"2024-11-05", "2024-11-05"},
-		{"2025-03-26", "2025-03-26"},
-		{"2025-06-18", "2025-06-18"},
-		{"2025-11-25", "2025-11-25"},
-		{"2026-07-28", "2025-11-25"},  // sessionless-only protocol: hard 400 on stateful
-		{"2027-03-18", "2025-11-25"},  // future version the SDK does not know yet
-		{"garbage", "2025-11-25"},     // not a version string at all
-		{"2025-06-18 ", "2025-11-25"}, // trailing space ≠ the accepted token: strict match only
-	}
-	for _, tc := range cases {
-		if got := rewriteProtocolVersion(tc.in); got != tc.want {
-			t.Errorf("rewriteProtocolVersion(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
-// discoverRequestBody is the server/discover probe a 2026-07-28 client (the
-// ChatGPT connector) sends: ONE request carrying BOTH the sessionless
-// protocol's MCP-Protocol-Version header (set by the caller) and its
-// per-request _meta version, plus the client identity keys the new protocol
-// stamps. With the header-only rewrite this shape died in -32020
-// (header 2025-11-25 vs _meta 2026-07-28) — the bug the discover responder
-// and the sync rewrite below exist to kill.
-const discoverRequestBody = `{"jsonrpc":"2.0","id":41,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"chatgpt-connector","version":"1"}}}}`
-
-// wantDiscoverVersions is the discover answer's supportedVersions: exactly
-// the stateful set, newest first, and pointedly WITHOUT 2026-07-28 — that
-// omission is the downgrade signal that steers a 2026-07-28 client back to
-// the legacy initialize handshake (official go-sdk protocol docs).
-var wantDiscoverVersions = []string{"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
-
-// TestHTTPDiscoverResponse: the single-message discover probe gets a direct
-// 200 answer (never an SDK -32601/-32020) with the four stateful versions,
-// capabilities.tools, and the same instructions text initialize sends. Both
-// framings are pinned: one SSE message frame when Accept lists
-// text/event-stream, raw JSON when it does not.
-func TestHTTPDiscoverResponse(t *testing.T) {
-	ts, dir := startHTTPTestServer(t)
-	endpoint := ts.URL + "/" + testToken + "/mcp"
-
-	for _, tc := range []struct {
-		name   string
-		accept string
-		sse    bool
-	}{
-		{"SSE frame when Accept lists text/event-stream", "application/json, text/event-stream", true},
-		{"plain JSON when Accept is application/json only", "application/json", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, strings.NewReader(discoverRequestBody))
-			if err != nil {
-				t.Fatalf("build request: %v", err)
-			}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", tc.accept)
-			req.Header.Set(mcpProtocolVersionHeader, "2026-07-28")
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("do request: %v", err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("discover: status = %d, want 200", resp.StatusCode)
-			}
-			b, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatalf("read body: %v", err)
-			}
-
-			var payload []byte
-			if tc.sse {
-				if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
-					t.Fatalf("Content-Type = %q, want text/event-stream", ct)
-				}
-				var data string
-				for _, line := range strings.Split(string(b), "\n") {
-					if v, ok := strings.CutPrefix(line, "data:"); ok {
-						data = strings.TrimSpace(v)
-					}
-				}
-				if !strings.Contains(string(b), "event: message") || data == "" {
-					t.Fatalf("discover: no SSE message frame:\n%s", b)
-				}
-				payload = []byte(data)
-			} else {
-				if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
-					t.Fatalf("Content-Type = %q, want application/json", ct)
-				}
-				payload = b
-			}
-
-			var frame struct {
-				JSONRPC string `json:"jsonrpc"`
-				ID      int    `json:"id"`
-				Result  struct {
-					SupportedVersions []string `json:"supportedVersions"`
-					Capabilities      struct {
-						Tools map[string]any `json:"tools"`
-					} `json:"capabilities"`
-					Instructions string `json:"instructions"`
-				} `json:"result"`
-			}
-			if err := json.Unmarshal(payload, &frame); err != nil {
-				t.Fatalf("discover: decode payload: %v\n%s", err, payload)
-			}
-			if frame.JSONRPC != "2.0" || frame.ID != 41 {
-				t.Errorf("envelope = jsonrpc %q id %d, want 2.0 echoing id 41", frame.JSONRPC, frame.ID)
-			}
-			if !slices.Equal(frame.Result.SupportedVersions, wantDiscoverVersions) {
-				t.Errorf("supportedVersions = %v, want exactly %v (newest first)", frame.Result.SupportedVersions, wantDiscoverVersions)
-			}
-			if strings.Contains(string(payload), "2026-07-28") {
-				t.Errorf("discover answer must not offer 2026-07-28 (it is the downgrade signal):\n%s", payload)
-			}
-			if frame.Result.Capabilities.Tools == nil {
-				t.Errorf("capabilities.tools missing from discover answer:\n%s", payload)
-			}
-			if !strings.Contains(frame.Result.Instructions, "under: "+dir) {
-				t.Errorf("instructions do not name the allowed root %q:\n%s", dir, frame.Result.Instructions)
-			}
-		})
-	}
-}
-
-// TestHTTPDiscoverInBatch: a batch carrying server/discover among other
-// messages is NOT intercepted (the responder only consumes single requests
-// — a batch cannot be split without stranding siblings) and must not die at
-// the HTTP level: the sync rewrite downgrades the out-of-set header and
-// _meta versions together, so no 400 and no -32020, and the SDK answers
-// in-band — -32601 for the discover element (a stateful server has no
-// discover), a normal result for the logging/setLevel sibling.
-func TestHTTPDiscoverInBatch(t *testing.T) {
-	ts, _ := startHTTPTestServer(t)
-	endpoint := ts.URL + "/" + testToken + "/mcp"
-
-	body := `[` +
-		`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}},` +
-		`{"jsonrpc":"2.0","id":2,"method":"logging/setLevel","params":{"level":"info","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}` +
-		`]`
-	resp := httpMCPPost(t, endpoint, body, "", "2026-07-28")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("batch with discover: status = %d, want 200 (in-band per-message answers, not an HTTP-level rejection)", resp.StatusCode)
-	}
-	b, err := io.ReadAll(resp.Body)
+// jsonQuote renders s as a JSON string literal (the one place the raw
+// bodies above need a runtime-interpolated value: the temp dir path).
+func jsonQuote(s string) string {
+	b, err := json.Marshal(s)
 	if err != nil {
-		t.Fatalf("read body: %v", err)
+		panic(err) // unreachable: marshaling a string
 	}
-	if strings.Contains(string(b), "-32020") {
-		t.Errorf("batch answer carries -32020 (header/_meta mismatch):\n%s", b)
-	}
-
-	// One outcome per request id in the batch.
-	outcomes := map[int]struct {
-		errCode  int
-		hasError bool
-		result   json.RawMessage
-	}{}
-	for _, line := range strings.Split(string(b), "\n") {
-		v, ok := strings.CutPrefix(line, "data:")
-		if !ok {
-			continue
-		}
-		var frame struct {
-			ID    int `json:"id"`
-			Error *struct {
-				Code int `json:"code"`
-			} `json:"error"`
-			Result json.RawMessage `json:"result"`
-		}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(v)), &frame); err != nil {
-			t.Fatalf("decode frame: %v\n%s", err, v)
-		}
-		o := outcomes[frame.ID]
-		o.result = frame.Result
-		if frame.Error != nil {
-			o.hasError = true
-			o.errCode = frame.Error.Code
-		}
-		outcomes[frame.ID] = o
-	}
-	if len(outcomes) != 2 {
-		t.Fatalf("batch answer frames = %d, want one per message (2):\n%s", len(outcomes), b)
-	}
-	if o := outcomes[1]; !o.hasError || o.errCode != -32601 {
-		t.Errorf("discover element outcome = (err=%v code=%d), want in-band -32601:\n%s", o.hasError, o.errCode, b)
-	}
-	if o := outcomes[2]; o.hasError || o.result == nil {
-		t.Errorf("logging/setLevel element outcome = (err=%v result=%s), want a normal result:\n%s", o.hasError, o.result, b)
-	}
-}
-
-// The post-downgrade traffic of a 2026-07-28 client: header AND params._meta
-// stamped 2026-07-28 on every request — the shape the ChatGPT connector
-// keeps sending after the discover answer steers it onto the legacy
-// handshake, and the one the sync rewrite (not the header-only rule) must
-// keep alive.
-const (
-	initializedMetaBody = `{"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
-	toolsListMetaBody   = `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
-)
-
-// TestHTTPMetaVersionSyncChain pins the header+_meta sync rewrite
-// end-to-end: initialize goes out plain (the legacy handshake the discover
-// answer chose), then notifications/initialized and tools/list each carry
-// consistent 2026-07-28 header AND _meta signals — both must be downgraded
-// to the legacy shape (key stripped, out-of-set header removed) so the pair
-// can never trip the SDK's -32020 mismatch nor its stateless-only 400 for
-// _meta-carrying messages. 202 for the notification, 200 with the full tool
-// set for the call.
-func TestHTTPMetaVersionSyncChain(t *testing.T) {
-	ts, _ := startHTTPTestServer(t)
-	endpoint := ts.URL + "/" + testToken + "/mcp"
-
-	sessionID := openRawSession(t, endpoint, "")
-
-	resp := httpMCPPost(t, endpoint, initializedMetaBody, sessionID, "2026-07-28")
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("notifications/initialized: status = %d, want 202", resp.StatusCode)
-	}
-
-	resp = httpMCPPost(t, endpoint, toolsListMetaBody, sessionID, "2026-07-28")
-	if names := decodeToolsListResponse(t, resp); !slices.Equal(names, wantToolNames) {
-		t.Errorf("tools/list tools = %v, want %v", names, wantToolNames)
-	}
-}
-
-// TestHTTPVersionRewriteBodyPassthrough: requests without a per-request
-// _meta version are forwarded byte-identically — the buffering middleware
-// must not corrupt or even re-encode such bodies. The second case is the
-// trap shape: the body merely MENTIONS the _meta key as data inside a tool
-// argument (substring hit, no structural params._meta match → still no
-// rewrite), and the first carries multi-byte UTF-8 both paths must round-trip
-// untouched. The header-only rule keeps applying in both cases.
-func TestHTTPVersionRewriteBodyPassthrough(t *testing.T) {
-	bodies := []string{
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"write","arguments":{"file_path":"/tmp/unicodé-世界.txt","content":"héllo → 世界 ✓"}}}`,
-		`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"write","arguments":{"file_path":"/tmp/x.txt","content":"mentions \"io.modelcontextprotocol/protocolVersion\" as data"}}}`,
-	}
-	for _, body := range bodies {
-		var gotBody []byte
-		var gotHeader string
-		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			gotBody, _ = io.ReadAll(r.Body)
-			gotHeader = r.Header.Get(mcpProtocolVersionHeader)
-		})
-		req := httptest.NewRequest(http.MethodPost, "/"+testToken+"/mcp", strings.NewReader(body))
-		req.Header.Set(mcpProtocolVersionHeader, "2026-07-28")
-		versionRewrite(inner).ServeHTTP(httptest.NewRecorder(), req)
-		if string(gotBody) != body {
-			t.Errorf("body not byte-identical through versionRewrite:\n got %s\nwant %s", gotBody, body)
-		}
-		if gotHeader != "2025-11-25" {
-			t.Errorf("inner header = %q, want the header-only rewrite to 2025-11-25", gotHeader)
-		}
-	}
-}
-
-// TestHTTPUnicodeBodyRoundTrip: one full-stack tools/call write whose body
-// carries multi-byte UTF-8 content, through the buffered-restore rewrite in
-// the chain — the bytes on disk must be exactly the content the JSON
-// carried, pinning that body buffering never corrupts unicode bodies.
-func TestHTTPUnicodeBodyRoundTrip(t *testing.T) {
-	ts, dir := startHTTPTestServer(t)
-	endpoint := ts.URL + "/" + testToken + "/mcp"
-	sessionID := openRawSession(t, endpoint, "")
-
-	resp := httpMCPPost(t, endpoint, initializedNotificationBody, sessionID, "")
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("notifications/initialized: status = %d, want 202", resp.StatusCode)
-	}
-
-	const content = "héllo → 世界 ✓"
-	path := filepath.Join(dir, "unicode.txt")
-	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"write","arguments":{"file_path":%q,"content":%q}}}`, path, content)
-	resp = httpMCPPost(t, endpoint, body, sessionID, "2026-07-28")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("tools/call write: status = %d, want 200", resp.StatusCode)
-	}
-	if b, err := os.ReadFile(path); err != nil || string(b) != content {
-		t.Errorf("disk = %q (%v), want exactly the unicode content %q", b, err, content)
-	}
+	return string(b)
 }
