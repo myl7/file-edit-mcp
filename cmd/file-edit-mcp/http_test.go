@@ -4,14 +4,18 @@
 // isolation (a read on connection A must not unlock an edit on connection
 // B; a cross-connection concurrent write must surface as EStaleRead on the
 // connection whose marker went stale), the token-path routing (everything
-// but /{token}/mcp is a mux 404), the initialize-result instructions, and
-// the MCP-Protocol-Version downgrade for the sessionless-protocol header.
+// but /{token}/mcp is a mux 404), the initialize-result instructions, the
+// MCP-Protocol-Version downgrade for the sessionless-protocol header, the
+// header/_meta sync rewrite that keeps 2026-07-28 clients (the ChatGPT
+// connector) past the SDK's -32020 mismatch, and the direct server/discover
+// responder that steers them back onto the legacy initialize handshake.
 
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -462,5 +466,276 @@ func TestRewriteProtocolVersion(t *testing.T) {
 		if got := rewriteProtocolVersion(tc.in); got != tc.want {
 			t.Errorf("rewriteProtocolVersion(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// discoverRequestBody is the server/discover probe a 2026-07-28 client (the
+// ChatGPT connector) sends: ONE request carrying BOTH the sessionless
+// protocol's MCP-Protocol-Version header (set by the caller) and its
+// per-request _meta version, plus the client identity keys the new protocol
+// stamps. With the header-only rewrite this shape died in -32020
+// (header 2025-11-25 vs _meta 2026-07-28) — the bug the discover responder
+// and the sync rewrite below exist to kill.
+const discoverRequestBody = `{"jsonrpc":"2.0","id":41,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"chatgpt-connector","version":"1"}}}}`
+
+// wantDiscoverVersions is the discover answer's supportedVersions: exactly
+// the stateful set, newest first, and pointedly WITHOUT 2026-07-28 — that
+// omission is the downgrade signal that steers a 2026-07-28 client back to
+// the legacy initialize handshake (official go-sdk protocol docs).
+var wantDiscoverVersions = []string{"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
+
+// TestHTTPDiscoverResponse: the single-message discover probe gets a direct
+// 200 answer (never an SDK -32601/-32020) with the four stateful versions,
+// capabilities.tools, and the same instructions text initialize sends. Both
+// framings are pinned: one SSE message frame when Accept lists
+// text/event-stream, raw JSON when it does not.
+func TestHTTPDiscoverResponse(t *testing.T) {
+	ts, dir := startHTTPTestServer(t)
+	endpoint := ts.URL + "/" + testToken + "/mcp"
+
+	for _, tc := range []struct {
+		name   string
+		accept string
+		sse    bool
+	}{
+		{"SSE frame when Accept lists text/event-stream", "application/json, text/event-stream", true},
+		{"plain JSON when Accept is application/json only", "application/json", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, strings.NewReader(discoverRequestBody))
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", tc.accept)
+			req.Header.Set(mcpProtocolVersionHeader, "2026-07-28")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("discover: status = %d, want 200", resp.StatusCode)
+			}
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+
+			var payload []byte
+			if tc.sse {
+				if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+					t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+				}
+				var data string
+				for _, line := range strings.Split(string(b), "\n") {
+					if v, ok := strings.CutPrefix(line, "data:"); ok {
+						data = strings.TrimSpace(v)
+					}
+				}
+				if !strings.Contains(string(b), "event: message") || data == "" {
+					t.Fatalf("discover: no SSE message frame:\n%s", b)
+				}
+				payload = []byte(data)
+			} else {
+				if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+					t.Fatalf("Content-Type = %q, want application/json", ct)
+				}
+				payload = b
+			}
+
+			var frame struct {
+				JSONRPC string `json:"jsonrpc"`
+				ID      int    `json:"id"`
+				Result  struct {
+					SupportedVersions []string `json:"supportedVersions"`
+					Capabilities      struct {
+						Tools map[string]any `json:"tools"`
+					} `json:"capabilities"`
+					Instructions string `json:"instructions"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(payload, &frame); err != nil {
+				t.Fatalf("discover: decode payload: %v\n%s", err, payload)
+			}
+			if frame.JSONRPC != "2.0" || frame.ID != 41 {
+				t.Errorf("envelope = jsonrpc %q id %d, want 2.0 echoing id 41", frame.JSONRPC, frame.ID)
+			}
+			if !slices.Equal(frame.Result.SupportedVersions, wantDiscoverVersions) {
+				t.Errorf("supportedVersions = %v, want exactly %v (newest first)", frame.Result.SupportedVersions, wantDiscoverVersions)
+			}
+			if strings.Contains(string(payload), "2026-07-28") {
+				t.Errorf("discover answer must not offer 2026-07-28 (it is the downgrade signal):\n%s", payload)
+			}
+			if frame.Result.Capabilities.Tools == nil {
+				t.Errorf("capabilities.tools missing from discover answer:\n%s", payload)
+			}
+			if !strings.Contains(frame.Result.Instructions, "under: "+dir) {
+				t.Errorf("instructions do not name the allowed root %q:\n%s", dir, frame.Result.Instructions)
+			}
+		})
+	}
+}
+
+// TestHTTPDiscoverInBatch: a batch carrying server/discover among other
+// messages is NOT intercepted (the responder only consumes single requests
+// — a batch cannot be split without stranding siblings) and must not die at
+// the HTTP level: the sync rewrite downgrades the out-of-set header and
+// _meta versions together, so no 400 and no -32020, and the SDK answers
+// in-band — -32601 for the discover element (a stateful server has no
+// discover), a normal result for the logging/setLevel sibling.
+func TestHTTPDiscoverInBatch(t *testing.T) {
+	ts, _ := startHTTPTestServer(t)
+	endpoint := ts.URL + "/" + testToken + "/mcp"
+
+	body := `[` +
+		`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}},` +
+		`{"jsonrpc":"2.0","id":2,"method":"logging/setLevel","params":{"level":"info","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}` +
+		`]`
+	resp := httpMCPPost(t, endpoint, body, "", "2026-07-28")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("batch with discover: status = %d, want 200 (in-band per-message answers, not an HTTP-level rejection)", resp.StatusCode)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if strings.Contains(string(b), "-32020") {
+		t.Errorf("batch answer carries -32020 (header/_meta mismatch):\n%s", b)
+	}
+
+	// One outcome per request id in the batch.
+	outcomes := map[int]struct {
+		errCode  int
+		hasError bool
+		result   json.RawMessage
+	}{}
+	for _, line := range strings.Split(string(b), "\n") {
+		v, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		var frame struct {
+			ID    int `json:"id"`
+			Error *struct {
+				Code int `json:"code"`
+			} `json:"error"`
+			Result json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(v)), &frame); err != nil {
+			t.Fatalf("decode frame: %v\n%s", err, v)
+		}
+		o := outcomes[frame.ID]
+		o.result = frame.Result
+		if frame.Error != nil {
+			o.hasError = true
+			o.errCode = frame.Error.Code
+		}
+		outcomes[frame.ID] = o
+	}
+	if len(outcomes) != 2 {
+		t.Fatalf("batch answer frames = %d, want one per message (2):\n%s", len(outcomes), b)
+	}
+	if o := outcomes[1]; !o.hasError || o.errCode != -32601 {
+		t.Errorf("discover element outcome = (err=%v code=%d), want in-band -32601:\n%s", o.hasError, o.errCode, b)
+	}
+	if o := outcomes[2]; o.hasError || o.result == nil {
+		t.Errorf("logging/setLevel element outcome = (err=%v result=%s), want a normal result:\n%s", o.hasError, o.result, b)
+	}
+}
+
+// The post-downgrade traffic of a 2026-07-28 client: header AND params._meta
+// stamped 2026-07-28 on every request — the shape the ChatGPT connector
+// keeps sending after the discover answer steers it onto the legacy
+// handshake, and the one the sync rewrite (not the header-only rule) must
+// keep alive.
+const (
+	initializedMetaBody = `{"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
+	toolsListMetaBody   = `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
+)
+
+// TestHTTPMetaVersionSyncChain pins the header+_meta sync rewrite
+// end-to-end: initialize goes out plain (the legacy handshake the discover
+// answer chose), then notifications/initialized and tools/list each carry
+// consistent 2026-07-28 header AND _meta signals — both must be downgraded
+// to the legacy shape (key stripped, out-of-set header removed) so the pair
+// can never trip the SDK's -32020 mismatch nor its stateless-only 400 for
+// _meta-carrying messages. 202 for the notification, 200 with the full tool
+// set for the call.
+func TestHTTPMetaVersionSyncChain(t *testing.T) {
+	ts, _ := startHTTPTestServer(t)
+	endpoint := ts.URL + "/" + testToken + "/mcp"
+
+	sessionID := openRawSession(t, endpoint, "")
+
+	resp := httpMCPPost(t, endpoint, initializedMetaBody, sessionID, "2026-07-28")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("notifications/initialized: status = %d, want 202", resp.StatusCode)
+	}
+
+	resp = httpMCPPost(t, endpoint, toolsListMetaBody, sessionID, "2026-07-28")
+	if names := decodeToolsListResponse(t, resp); !slices.Equal(names, wantToolNames) {
+		t.Errorf("tools/list tools = %v, want %v", names, wantToolNames)
+	}
+}
+
+// TestHTTPVersionRewriteBodyPassthrough: requests without a per-request
+// _meta version are forwarded byte-identically — the buffering middleware
+// must not corrupt or even re-encode such bodies. The second case is the
+// trap shape: the body merely MENTIONS the _meta key as data inside a tool
+// argument (substring hit, no structural params._meta match → still no
+// rewrite), and the first carries multi-byte UTF-8 both paths must round-trip
+// untouched. The header-only rule keeps applying in both cases.
+func TestHTTPVersionRewriteBodyPassthrough(t *testing.T) {
+	bodies := []string{
+		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"write","arguments":{"file_path":"/tmp/unicodé-世界.txt","content":"héllo → 世界 ✓"}}}`,
+		`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"write","arguments":{"file_path":"/tmp/x.txt","content":"mentions \"io.modelcontextprotocol/protocolVersion\" as data"}}}`,
+	}
+	for _, body := range bodies {
+		var gotBody []byte
+		var gotHeader string
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotBody, _ = io.ReadAll(r.Body)
+			gotHeader = r.Header.Get(mcpProtocolVersionHeader)
+		})
+		req := httptest.NewRequest(http.MethodPost, "/"+testToken+"/mcp", strings.NewReader(body))
+		req.Header.Set(mcpProtocolVersionHeader, "2026-07-28")
+		versionRewrite(inner).ServeHTTP(httptest.NewRecorder(), req)
+		if string(gotBody) != body {
+			t.Errorf("body not byte-identical through versionRewrite:\n got %s\nwant %s", gotBody, body)
+		}
+		if gotHeader != "2025-11-25" {
+			t.Errorf("inner header = %q, want the header-only rewrite to 2025-11-25", gotHeader)
+		}
+	}
+}
+
+// TestHTTPUnicodeBodyRoundTrip: one full-stack tools/call write whose body
+// carries multi-byte UTF-8 content, through the buffered-restore rewrite in
+// the chain — the bytes on disk must be exactly the content the JSON
+// carried, pinning that body buffering never corrupts unicode bodies.
+func TestHTTPUnicodeBodyRoundTrip(t *testing.T) {
+	ts, dir := startHTTPTestServer(t)
+	endpoint := ts.URL + "/" + testToken + "/mcp"
+	sessionID := openRawSession(t, endpoint, "")
+
+	resp := httpMCPPost(t, endpoint, initializedNotificationBody, sessionID, "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("notifications/initialized: status = %d, want 202", resp.StatusCode)
+	}
+
+	const content = "héllo → 世界 ✓"
+	path := filepath.Join(dir, "unicode.txt")
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"write","arguments":{"file_path":%q,"content":%q}}}`, path, content)
+	resp = httpMCPPost(t, endpoint, body, sessionID, "2026-07-28")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("tools/call write: status = %d, want 200", resp.StatusCode)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != content {
+		t.Errorf("disk = %q (%v), want exactly the unicode content %q", b, err, content)
 	}
 }

@@ -21,7 +21,18 @@
   token 路由之内、SDK handler 之外加一层改写中间件：请求头版本不在本 server 实际支持的版本集
   （2024-11-05、2025-03-26、2025-06-18、2025-11-25）内即改写为 initialize 协商上限
   2025-11-25（未知/未来版本同样改写，保持向前兼容）；改写后的 batch POST 仍会按 ≥2025-06-18
-  的规范规则被 SDK 拒绝，属规范行为，刻意不绕过。**不再前置 nginx basic auth**：token 即唯一鉴权，轮换 = 改
+  的规范规则被 SDK 拒绝，属规范行为，刻意不绕过。单条 `server/discover` 请求（2026-07-28
+  客户端握手的探测请求，ChatGPT connector 即此形态：头与 `params._meta` 同带 2026-07-28）由
+  token 路由内最外层的新中间件直接作答，`supportedVersions` 只列上述四个 stateful 版本、刻意
+  不含 2026-07-28——按官方协议文档，discover 应答不含客户端版本即令其回退到 legacy initialize
+  握手（本 server 服务良好），而 stateful SDK handler 自身给不出可用 discover 应答；谎报
+  2026-07-28 只会把客户端推进本 server 必须拒绝的 sessionless 请求。带 `_meta` 版本的请求则
+  由改写中间件成对降级：消息 `params._meta["io.modelcontextprotocol/protocolVersion"]` 版本在
+  支持集外即删除该键（batch 数组逐条处理，其余 `_meta` 键保留），并连带移除集外的
+  `MCP-Protocol-Version` 头——两者一起降为 legacy 形态，彻底消除头/`_meta` 不一致触发的
+  -32020（SDK 对任何携带 `_meta` 版本的非 discover 消息在 stateful 上一律 400，故只能删键而非
+  改值）；batch 内的 discover 元素不拦截，由 SDK 以 in-band -32601 应答、其余消息正常处理。
+  **不再前置 nginx basic auth**：token 即唯一鉴权，轮换 = 改
   环境变量 + 重建容器。
 - server instructions（MCP 的 AGENTS.md 等价物）：initialize result 的 `instructions` 字段在
   每次构造 server（stdio 与每个 HTTP 会话）时设置。默认文本仅一句话：插值实际允许目录的根
