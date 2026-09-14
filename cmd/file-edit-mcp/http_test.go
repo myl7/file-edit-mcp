@@ -7,10 +7,10 @@
 // header-stamped tools/call. Plus the marker semantics in both scopes the
 // token-as-session model defines (within one token: one read anywhere
 // unlocks that token's writes across all its stateless requests; across
-// tokens: markers are isolated — EUnreadWrite — while any writer stales
-// every other token's marker — EStaleRead; a never-read file stays
-// EUnreadWrite) and the token-path routing (everything but /{token}/mcp is
-// a mux 404).
+// tokens: markers are isolated — the never-read EStaleRead variant — while
+// any writer stales every other token's marker — the stale variant; a
+// never-read file stays fenced off with the never-read variant) and the
+// token-path routing (everything but /{token}/mcp is a mux 404).
 
 package main
 
@@ -218,12 +218,13 @@ func TestHTTPWriteReadE2E(t *testing.T) {
 // TestHTTPProcessWideMarkers pins the approved marker semantics of the
 // stateless transport: the read-before-write markers live on ONE Conn for
 // the whole process, so client-session boundaries no longer isolate them.
-// A's read unlocks B's edit (EUnreadWrite is now "not read anywhere in this
-// process"); a change the process never saw (an out-of-band disk write —
-// anything this process wrote refreshed the marker, because then the
-// content is known) is still EStaleRead; a file no request ever read stays
-// EUnreadWrite. The old TestHTTPSessionIsolation asserted the opposite
-// first arm; that isolation is deliberately gone (see tools.Conn).
+// A's read unlocks B's edit (the never-read EStaleRead variant means "not
+// read anywhere in this process"); a change the process never saw (an
+// out-of-band disk write — anything this process wrote refreshed the
+// marker, because then the content is known) is still the stale EStaleRead
+// variant; a file no request ever read stays fenced off with the never-read
+// variant. The old TestHTTPSessionIsolation asserted the opposite first
+// arm; that isolation is deliberately gone (see tools.Conn).
 func TestHTTPProcessWideMarkers(t *testing.T) {
 	ts, dir := startHTTPTestServer(t)
 	a := connectHTTP(t, ts)
@@ -239,7 +240,8 @@ func TestHTTPProcessWideMarkers(t *testing.T) {
 	}
 
 	// B edits without any read of its own: SUCCEEDS — A's read is process-
-	// wide. (This exact call was EUnreadWrite under per-session markers.)
+	// wide. (This exact call hit the never-read EStaleRead variant under
+	// per-session markers.)
 	if text, isErr := httpCallTool(t, b, "edit", map[string]any{
 		"file_path": path, "old_string": "v0", "new_string": "from B",
 	}); isErr {
@@ -278,7 +280,8 @@ func TestHTTPProcessWideMarkers(t *testing.T) {
 		t.Errorf("disk = %q, want A's edit after the re-read", got)
 	}
 
-	// A never-read existing file stays fenced off for everyone: EUnreadWrite.
+	// A never-read existing file stays fenced off for everyone: the
+	// never-read EStaleRead variant.
 	unseen := filepath.Join(dir, "unseen.txt")
 	if err := os.WriteFile(unseen, []byte("never read\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -286,8 +289,8 @@ func TestHTTPProcessWideMarkers(t *testing.T) {
 	text, isErr = httpCallTool(t, b, "write", map[string]any{
 		"file_path": unseen, "content": "x\n",
 	})
-	if !isErr || !strings.Contains(text, "has not been read in this session") {
-		t.Fatalf("write to never-read file: (isErr=%v) %q, want EUnreadWrite", isErr, text)
+	if !isErr || !strings.Contains(text, "has not been read in this session; read it before writing") {
+		t.Fatalf("write to never-read file: (isErr=%v) %q, want the never-read EStaleRead variant", isErr, text)
 	}
 }
 
@@ -364,13 +367,13 @@ func TestHTTPMultiTokenRouting(t *testing.T) {
 
 // TestHTTPCrossTokenIsolation is the headline token-as-session test: two
 // tokens, two dedicated Conns, one file — the cross-client isolation the
-// stateless protocol removed, restored along the credential axis.
-// EUnreadWrite is per token (A's read does not authorize B's edit); ANY
-// writer stales every other token's marker because EStaleRead compares
-// against the file's CURRENT state (B's successful edit leaves A's marker
-// stale → A gets EStaleRead; an out-of-band disk write stales both); a
-// never-read file is EUnreadWrite for both tokens; each re-read re-arms
-// only that token.
+// stateless protocol removed, restored along the credential axis. The
+// never-read EStaleRead variant is per token (A's read does not authorize
+// B's edit); ANY writer stales every other token's marker because the
+// stale variant compares against the file's CURRENT state (B's successful
+// edit leaves A's marker stale → A gets the stale variant; an out-of-band
+// disk write stales both); a never-read file is fenced off for both tokens;
+// each re-read re-arms only that token.
 func TestHTTPCrossTokenIsolation(t *testing.T) {
 	const tokA, tokB = "iso-token-a", "iso-token-b"
 	ts, dir := startMultiTokenHTTPTestServer(t, tokA, tokB)
@@ -386,15 +389,15 @@ func TestHTTPCrossTokenIsolation(t *testing.T) {
 		t.Fatalf("A read: unexpected error: %s", text)
 	}
 
-	// B's edit without a read of its own: EUnreadWrite — A's read does not
-	// authorize B (the exact call that SUCCEEDS under one shared Conn in
-	// TestHTTPProcessWideMarkers, fenced again now that markers are per
-	// token).
+	// B's edit without a read of its own: the never-read EStaleRead variant —
+	// A's read does not authorize B (the exact call that SUCCEEDS under one
+	// shared Conn in TestHTTPProcessWideMarkers, fenced again now that
+	// markers are per token).
 	text, isErr := httpCallTool(t, b, "edit", map[string]any{
 		"file_path": path, "old_string": "v0", "new_string": "from B",
 	})
-	if !isErr || !strings.Contains(text, "has not been read in this session") {
-		t.Fatalf("B edit after A's read: (isErr=%v) %q, want EUnreadWrite", isErr, text)
+	if !isErr || !strings.Contains(text, "has not been read in this session; read it before writing") {
+		t.Fatalf("B edit after A's read: (isErr=%v) %q, want the never-read EStaleRead variant", isErr, text)
 	}
 
 	// B reads F, then B's edit succeeds.
@@ -432,7 +435,8 @@ func TestHTTPCrossTokenIsolation(t *testing.T) {
 		t.Fatalf("disk = %q, want A's edit applied", got)
 	}
 
-	// A never-read existing file stays fenced off for BOTH tokens.
+	// A never-read existing file stays fenced off for BOTH tokens with the
+	// never-read EStaleRead variant.
 	unseen := filepath.Join(dir, "unseen-cross.txt")
 	if err := os.WriteFile(unseen, []byte("never read\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -441,8 +445,8 @@ func TestHTTPCrossTokenIsolation(t *testing.T) {
 		text, isErr = httpCallTool(t, cs, "write", map[string]any{
 			"file_path": unseen, "content": "x\n",
 		})
-		if !isErr || !strings.Contains(text, "has not been read in this session") {
-			t.Errorf("token %s write to never-read file: (isErr=%v) %q, want EUnreadWrite", name, isErr, text)
+		if !isErr || !strings.Contains(text, "has not been read in this session; read it before writing") {
+			t.Errorf("token %s write to never-read file: (isErr=%v) %q, want the never-read EStaleRead variant", name, isErr, text)
 		}
 	}
 

@@ -31,7 +31,6 @@ var (
 	ErrAmbiguous     = errors.New("EAmbiguous")
 	ErrNoop          = errors.New("ENoop")
 	ErrEmptyOld      = errors.New("EEmptyOld")
-	ErrUnreadWrite   = errors.New("EUnreadWrite")
 	ErrStaleRead     = errors.New("EStaleRead")
 	ErrBackend       = errors.New("EBackend")
 	ErrEditIndex     = errors.New("EEditIndex")
@@ -138,17 +137,26 @@ func EEmptyOld() error {
 	return &Error{sentinel: ErrEmptyOld, msg: "old_string is empty; it would match everywhere. Provide the exact text to replace."}
 }
 
-// EUnreadWrite rejects writing a file that has not been read this session
-// (§5.2 write, §5.3 edit).
-func EUnreadWrite(path string) error {
-	return &Error{sentinel: ErrUnreadWrite, msg: fmt.Sprintf(
-		"file exists but has not been read in this session; call read first: %s", path)}
-}
-
-// EStaleRead rejects editing a file that changed since last read (§5.3).
+// EStaleRead is the stale variant of the write gate: it rejects modifying a
+// file that changed since the caller's last read (§5.2 write, §5.3/§5.4
+// edit/multi_edit). The gate's never-read variant is EStaleReadNeverRead;
+// both share the ErrStaleRead sentinel, so control flow (retry policy, MCP
+// error mapping) never distinguishes them — the model's remedy is identical
+// in both cases: read, then write.
 func EStaleRead(path string) error {
 	return &Error{sentinel: ErrStaleRead, msg: fmt.Sprintf(
 		"file changed since last read; read it again before editing: %s", path)}
+}
+
+// EStaleReadNeverRead is the never-read variant of the write gate: no
+// session marker exists, so any current state counts as
+// changed-since-last-known (§5.2 write, §5.3/§5.4 edit/multi_edit). It
+// reports the same ErrStaleRead sentinel as EStaleRead —
+// errors.Is(err, ErrStaleRead) is true for both variants — because the
+// remedy is the same: read the file, then modify it.
+func EStaleReadNeverRead(path string) error {
+	return &Error{sentinel: ErrStaleRead, msg: fmt.Sprintf(
+		"file has not been read in this session; read it before writing: %s", path)}
 }
 
 // EBackend reports a CIFS soft-mount backend failure (§8). cause is the

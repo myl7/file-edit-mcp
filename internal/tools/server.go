@@ -90,19 +90,20 @@ func NewShared(allowedDirs []string, log *slog.Logger) (*Shared, error) {
 // (token-as-session: the token in /{token}/mcp is the session identity),
 // registering it on every per-request *mcp.Server that route's
 // StreamableHTTP GetServer callback constructs. Marker semantics follow
-// that scope: EUnreadWrite is PER TOKEN (a file read under token A does
-// not authorize a write under token B — the cross-client isolation the
-// stateless 2026-07-28 protocol, SEP-2567, removed is restored along the
-// one axis that protocol leaves standing, the credential), while
-// EStaleRead compares against the file's CURRENT state, so ANY writer —
-// another token or an out-of-band disk change — stales every other
-// token's marker for that path. Within one token the markers persist
-// across stateless requests (statelessness carries no sessions, but the
-// Conn does) and reset on process restart. Cross-token same-file
-// concurrency is safe without a shared lock: each write is an atomic
-// temp+rename, and the editor's pre-write re-stat turns the loser of a
-// race into EStaleRead, never a silent overwrite; same-path writes under
-// ONE token stay serialized by that token's per-path lock table.
+// that scope: the write gate EStaleRead is PER TOKEN — its never-read
+// variant means a file read under token A does not authorize a write under
+// token B (the cross-client isolation the stateless 2026-07-28 protocol,
+// SEP-2567, removed is restored along the one axis that protocol leaves
+// standing, the credential) — while the stale variant compares against the
+// file's CURRENT state, so ANY writer — another token or an out-of-band
+// disk change — stales every other token's marker for that path. Within
+// one token the markers persist across stateless requests (statelessness
+// carries no sessions, but the Conn does) and reset on process restart.
+// Cross-token same-file concurrency is safe without a shared lock: each
+// write is an atomic temp+rename, and the pre-write re-stat shared by
+// editFlow and Write turns the loser of a race into EStaleRead, never a
+// silent overwrite; same-path writes under ONE token stay serialized by
+// that token's per-path lock table.
 //
 // Concurrent use by overlapping requests is safe: Session guards markers
 // and locks behind one mutex (verified with -race), and Register is pure

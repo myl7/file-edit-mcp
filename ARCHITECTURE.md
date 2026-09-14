@@ -29,11 +29,12 @@
   （已删），审计面是前置 nginx 的 access log。**每请求一个 `*mcp.Server`**（GetServer 回调；
   SDK 文档明示可每次返回新实例），**每 token 一个 `tools.Conn`、一个专属 StreamableHTTPHandler
   实例、一条精确匹配路由**——**token 即会话身份**（token-as-session，§7）：无会话协议没有会话
-  可隔离，但凭证轴仍在，跨客户端隔离沿 token 恢复。标记语义随此作用域：EUnreadWrite **按
-  token 判定**（token A 下读过某文件不授权 token B 下写它）；EStaleRead 与文件**当前状态**
-  比较，任何写者——另一 token 或进程外磁盘改动——都把其他所有 token 对该路径的标记打 stale；
-  同一 token 内标记跨 stateless 请求持久（进程重启即重置；per-request Conn 会令标记随请求重置、
-  每次写都 EUnreadWrite，故 Conn 在回调外构造、闭包绑定、回调内不解析路径）。跨 token 同文件
+  可隔离，但凭证轴仍在，跨客户端隔离沿 token 恢复。标记语义随此作用域：写栅栏 EStaleRead **按
+  token 判定**（未读与读后被改两个文案变体共用一个代号；token A 下读过某文件不授权 token B
+  下写它）；stale 判定与文件**当前状态**比较，任何写者——另一 token 或进程外磁盘改动——都把
+  其他所有 token 对该路径的标记打 stale；同一 token 内标记跨 stateless 请求持久（进程重启即
+  重置；per-request Conn 会令标记随请求重置、每次写都被栅栏拦下直到重新 read，故 Conn 在回调
+  外构造、闭包绑定、回调内不解析路径）。跨 token 同文件
   并发无需共享锁也安全：原子 temp+rename 写入 + 写前重 stat，输家得 EStaleRead，绝不静默覆盖；
   同 token 内同路径写仍由该 token 的锁表串行化。多个 stateless handler 实例不共享任何会冲突的
   状态（对 go-sdk v1.7.0 核实：handler 只持有自身 GetServer 回调/选项/会话簿记，stateless 路径
@@ -129,8 +130,12 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 
 参数：`file_path`(必)、`content`(必，完整内容)。只用于新建和整体重写，不追加。
 
-- 目标已存在且本会话未成功 read 过 → `EUnreadWrite`。
-- 目标不存在时以 `O_EXCL` 新建；若并发被抢先创建 → `EUnreadWrite`。
+- 目标已存在时过与 edit 同一的新鲜度栅栏（write 的栅栏在此变更中与 edit/multi_edit 统一，
+  此前 write 只查「读过没有」、不复查新鲜度）：本会话未读过 → `EStaleRead`（未读变体）；
+  上次 read 后文件变了（size 或 mtime）→ `EStaleRead`（stale 变体）。补救一致：先 read 再写。
+- 目标不存在时以 `O_EXCL` 新建；若并发被抢先创建 → `EStaleRead`（未读变体：文件已存在而
+  本会话没读过它）。
+- 落盘前重 stat：size/mtime 与栅栏判定时不一致 → `EStaleRead`（防并发覆盖，同 §5.3）。
 - 原子写：同目录临时文件（前缀 `.file-edit-mcp-`）→ 写入 → `chmod`（已存在文件沿用原 mode，
   新文件 0644）→ `rename` 覆盖目标。失败清理临时文件。CIFS 上 mode 是装饰性的，尽力而为。
 - 父目录不存在 → `EParentMissing`（不自动建目录）。
@@ -143,8 +148,8 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 - **逐字节精确匹配**：包含空白和缩进，不做 trim、不做缩进重排、不做任何模糊回退。
 - `old_string` 为空 → `EEmptyOld`；`old_string == new_string` → `ENoop`。
 - `replace_all=false` 时要求唯一：0 次命中 → `ENoMatch`；多于 1 次 → `EAmbiguous`（给次数和前 5 处行号）。
-- 文件不存在 → `ENotExist`（与匹配失败是两个错误，不许合并）；未读 → `EUnreadWrite`；
-  上次 read 后文件变了（size 或 mtime）→ `EStaleRead`。
+- 文件不存在 → `ENotExist`（与匹配失败是两个错误，不许合并）；未读 → `EStaleRead`（未读
+  变体）；上次 read 后文件变了（size 或 mtime）→ `EStaleRead`（stale 变体）。
 - 全部编辑在内存中应用完、通过校验后才落盘（同 §5.2 的原子写路径）。
 - 落盘前若 mtime/size 与 read 时记录不一致 → `EStaleRead`（防并发覆盖）。
 
@@ -196,20 +201,24 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 | EAmbiguous | `old_string matches %d times in %s (first at line(s) %s). Include more surrounding context in old_string to make it unique, or set replace_all=true.` |
 | ENoop | `old_string is identical to new_string; nothing to do` |
 | EEmptyOld | `old_string is empty; it would match everywhere. Provide the exact text to replace.` |
-| EUnreadWrite | `file exists but has not been read in this session; call read first: %s` |
-| EStaleRead | `file changed since last read; read it again before editing: %s` |
+| EStaleRead | 未读变体：`file has not been read in this session; read it before writing: %s`；stale 变体：`file changed since last read; read it again before editing: %s` |
 | EBackend | `storage backend is unreachable or waking up (CIFS soft mount): %v. Retry shortly; if it persists, check the share server.` |
 | EEditIndex | `edit #%d failed: %v`（multi_edit 包裹层） |
 
 要求：每条错误说清原因 + 给可操作的下一步；不回显整段原文或整个文件。
 
+EStaleRead 是唯一的写栅栏代号（原先独立的「未读就写」代号已并入）：未读与读后被改两个文案
+变体共用一个 sentinel（`errors.Is` 同真），因为模型侧补救一致——先 read 再写；write 工具的
+栅栏在同一次变更中与 edit/multi_edit 统一（此前 write 只查读过没有、不复查新鲜度）。
+
 ## 7. 会话与并发
 
 - 「会话」= 一个 MCP 客户端连接的生命周期——该等式现仅对 stdio 成立（一进程一连接）。HTTP
   模式 stateless（§0）：每请求一个 server 实例，注册在该 token 的专属 Conn 上——**token 即
-  会话身份**：已读跟踪与路径锁表的作用域是 **token**。EUnreadWrite 按 token 判定（跨 token
-  隔离沿凭证轴恢复）；EStaleRead 对文件当前状态比较，任何写者（另一 token 或进程外改动）把
-  其他 token 的标记打 stale；同 token 内标记跨请求持久、随进程重启重置。stale-read 栅栏不变；
+  会话身份**：已读跟踪与路径锁表的作用域是 **token**。写栅栏 EStaleRead 按 token 判定（未读
+  变体实现跨 token 隔离：token A 的读不授权 token B 的写）；stale 变体对文件当前状态比较，
+  任何写者（另一 token 或进程外改动）把其他 token 的标记打 stale；同 token 内标记跨请求持久、
+  随进程重启重置。统一栅栏（write/edit/multi_edit 同一判定）沿此作用域不变；
   同路径写串行化在 token 内由该 token 的锁表保证，跨 token 由原子 temp+rename + 写前重 stat
   兜底（输家 EStaleRead，绝不静默覆盖）。
 - `internal/session`：`map[resolvedPath]marker{size, mtime}`（read 成功时记录），
@@ -245,7 +254,7 @@ errno 两类（`errors.Is` + syscall.Errno 判断）：
 5. 父目录不存在（write 新文件）→ EParentMissing。
 6. 路径越界：`..` 穿越、符号链接指向界外（用 tmp fixture 造真链接）、盘符形路径、相对路径。
 7. MultiEdit 第 i 项失败 → 整体不落盘、文件内容不变。
-8. 未读就写 / 读后被改 → EUnreadWrite / EStaleRead。
+8. 未读就写 / 读后被改 → EStaleRead 未读变体 / stale 变体（write/edit/multi_edit 同一判定）。
 9. rename 原子性：写失败时目标文件保持原内容、无残留临时文件。
 10. errno 分类：backend 类触发重试、ENOENT 不触发（用注入的假 op 函数测）。
 11. glob 的 mtime 排序、上限截断报告。

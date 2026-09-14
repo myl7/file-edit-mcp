@@ -7,8 +7,9 @@ import (
 )
 
 // TestCatalogGoldenMessages asserts the exact model-visible wording of all
-// 15 §6 catalog rows (golden snapshots) and that each constructor's error
-// matches its sentinel via errors.Is.
+// 14 §6 catalog rows (golden snapshots; EStaleRead carries two variant
+// wordings under its one row) and that each constructor's error matches
+// its sentinel via errors.Is.
 func TestCatalogGoldenMessages(t *testing.T) {
 	allowed := []string{"/data", "/data/other"}
 	cases := []struct {
@@ -84,10 +85,10 @@ func TestCatalogGoldenMessages(t *testing.T) {
 			sent: ErrEmptyOld,
 		},
 		{
-			name: "EUnreadWrite",
-			err:  EUnreadWrite("/data/a.go"),
-			want: `file exists but has not been read in this session; call read first: /data/a.go`,
-			sent: ErrUnreadWrite,
+			name: "EStaleReadNeverRead",
+			err:  EStaleReadNeverRead("/data/a.go"),
+			want: `file has not been read in this session; read it before writing: /data/a.go`,
+			sent: ErrStaleRead,
 		},
 		{
 			name: "EStaleRead",
@@ -191,12 +192,31 @@ func TestEEditIndexCauseChain(t *testing.T) {
 	}
 }
 
+// TestEStaleReadVariantsShareSentinel pins the merged write gate: the
+// never-read and the stale wording both report the ONE ErrStaleRead
+// sentinel (errors.Is is true for both — control flow must not care which
+// variant fired), while the messages stay distinct so the model sees which
+// remedy applies: read first, or re-read.
+func TestEStaleReadVariantsShareSentinel(t *testing.T) {
+	unread := EStaleReadNeverRead("/data/a.go")
+	stale := EStaleRead("/data/a.go")
+	if !errors.Is(unread, ErrStaleRead) {
+		t.Error("errors.Is(never-read variant, ErrStaleRead) = false, want true")
+	}
+	if !errors.Is(stale, ErrStaleRead) {
+		t.Error("errors.Is(stale variant, ErrStaleRead) = false, want true")
+	}
+	if unread.Error() == stale.Error() {
+		t.Errorf("never-read and stale variants render identically: %q", unread.Error())
+	}
+}
+
 // TestSentinelsDistinct ensures no two catalog rows share an identity.
 func TestSentinelsDistinct(t *testing.T) {
 	all := []error{
 		ErrNulByte, ErrWindowsPath, ErrRelative, ErrOutside, ErrParentMissing,
 		ErrNotExist, ErrIsDir, ErrNoMatch, ErrAmbiguous, ErrNoop, ErrEmptyOld,
-		ErrUnreadWrite, ErrStaleRead, ErrBackend, ErrEditIndex,
+		ErrStaleRead, ErrBackend, ErrEditIndex,
 	}
 	seen := make(map[error]bool, len(all))
 	for _, s := range all {

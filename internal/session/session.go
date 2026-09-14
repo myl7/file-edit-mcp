@@ -126,8 +126,9 @@ func (s *Session) LockFile(path string) func() {
 	return mu.Unlock
 }
 
-// Forget drops the read marker for path, so the next write to it is
-// rejected as unread until it is read again.
+// Forget drops the read marker for path, so the next modifying call on it
+// is rejected with the never-read EStaleRead variant until it is read
+// again.
 //
 // The per-path mutex entry is deliberately retained: deleting a mutex that
 // another goroutine still holds would let the next LockFile create a fresh

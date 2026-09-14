@@ -1,6 +1,7 @@
-// write tool handler (ARCHITECTURE §5.2): read-first check, O_EXCL claim
-// for new files, and the atomic temp-file + rename write path shared with
-// edit/multi_edit.
+// write tool handler (ARCHITECTURE §5.2): the freshness gate shared with
+// edit (unified: never-read and stale both report EStaleRead), the O_EXCL
+// claim for new files, and the atomic temp-file + rename write path shared
+// with edit/multi_edit.
 
 package tools
 
@@ -18,6 +19,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/myl7/file-edit-mcp/internal/errmsg"
+	"github.com/myl7/file-edit-mcp/internal/session"
 )
 
 // tempPrefix is the §5.2 same-directory temp-file prefix. The temp file
@@ -36,10 +38,15 @@ type writeAck struct {
 }
 
 // Write implements the write tool (§5.2): create-or-rewrite, never append.
-// Existing targets must have been read this session (EUnreadWrite), new
-// targets are claimed with O_EXCL (a lost race is also EUnreadWrite), and
-// the content lands via the atomic temp+rename path. The whole operation
-// runs under the per-path session lock (§7).
+// Existing targets pass the SAME freshness gate as edit (unified in this
+// change): the session marker must exist AND still match the file's
+// size/mtime — never read is the never-read EStaleRead variant, read but
+// changed the stale variant — followed by the same pre-write re-stat
+// editFlow runs (both checks mirror edit.go). New targets are claimed with
+// O_EXCL (a lost race reports the never-read variant too: the file now
+// exists with no read behind it), and the content lands via the atomic
+// temp+rename path. The whole operation runs under the per-path session
+// lock (§7).
 func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (*mcp.CallToolResult, any, error) {
 	resolved, err := s.Guard.Validate(in.FilePath)
 	if err != nil {
@@ -49,10 +56,13 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 	unlock := s.Sess.LockFile(resolved)
 	defer unlock()
 
-	// Step 1: does the target exist, and with which mode?
+	// Step 1: does the target exist, and with which mode/size/mtime? The
+	// stat doubles as the gate's "current state" sample (editFlow step 1).
 	var (
 		exists bool
 		mode   = os.FileMode(0o644) // §5.2: new files get 0644
+		size   int64
+		mtime  time.Time
 	)
 	err = s.Retry.Do(func() error {
 		root, rel, err := s.Roots.Resolve(resolved)
@@ -64,7 +74,7 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 			if info.IsDir() {
 				return errmsg.EIsDir(resolved)
 			}
-			exists, mode = true, info.Mode().Perm()
+			exists, mode, size, mtime = true, info.Mode().Perm(), info.Size(), info.ModTime()
 			return nil
 		}
 		if errors.Is(err, fs.ErrNotExist) {
@@ -81,13 +91,33 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 
 	claimed := false
 	if exists {
-		// §5.2: an existing target must have been read this session.
-		if _, read := s.Sess.Lookup(resolved); !read {
-			return nil, nil, errmsg.EUnreadWrite(resolved)
+		// §5.2 (unified gate): an existing target demands a CURRENT read —
+		// the same fence editFlow applies at its step 2. No marker at all is
+		// the never-read EStaleRead variant (with no read knowledge, any
+		// current state counts as changed-since-last-known); a marker that no
+		// longer matches the stat above is the stale variant. The remedy is
+		// identical either way: read, then write.
+		switch s.Sess.Compare(resolved, size, mtime) {
+		case session.StatusUnknown:
+			return nil, nil, errmsg.EStaleReadNeverRead(resolved)
+		case session.StatusStale:
+			return nil, nil, errmsg.EStaleRead(resolved)
+		}
+		// Pre-write re-check (editFlow step 4 mirrored): a writer that moved
+		// the file between the stat above and the rename — cross-token or
+		// out-of-band, invisible to this token's per-path lock — makes this
+		// EStaleRead instead of a silent wholesale overwrite of its work.
+		cursize, curmtime, _, err := s.statFile(resolved)
+		if err != nil {
+			return nil, nil, mapFSErr(err, resolved)
+		}
+		if cursize != size || !curmtime.Equal(mtime) {
+			return nil, nil, errmsg.EStaleRead(resolved)
 		}
 	} else {
-		// §5.2: claim the name exclusively; a concurrent creator beats us
-		// to the O_EXCL and the call reports EUnreadWrite.
+		// §5.2: claim the name exclusively; a concurrent creator beats us to
+		// the O_EXCL and the call reports the never-read EStaleRead variant
+		// (the file now exists with no read behind it).
 		err = s.Retry.Do(func() error {
 			root, rel, err := s.Roots.Resolve(resolved)
 			if err != nil {
@@ -96,7 +126,7 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 			f, err := root.OpenFile(rel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 			if err != nil {
 				if errors.Is(err, fs.ErrExist) {
-					return errmsg.EUnreadWrite(resolved)
+					return errmsg.EStaleReadNeverRead(resolved)
 				}
 				if errors.Is(err, fs.ErrNotExist) {
 					// The parent vanished between validation and now.
@@ -115,8 +145,9 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 	if err := s.atomicWrite(resolved, []byte(in.Content), mode); err != nil {
 		if claimed {
 			// The claim is an empty file we created; on failure restore the
-			// pre-call state so a retry is not blocked by EUnreadWrite
-			// against a file the caller never saw. Best effort.
+			// pre-call state so a retry is not blocked by the never-read
+			// EStaleRead variant against a file the caller never saw. Best
+			// effort.
 			_ = s.Retry.Do(func() error {
 				root, rel, err := s.Roots.Resolve(resolved)
 				if err != nil {
@@ -137,7 +168,8 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 // markKnown records a fresh post-write marker for resolved. If the stat
 // fails (e.g. a late backend hiccup) the write still succeeded, so a
 // deliberately stale marker is recorded (size only, zero mtime): the next
-// edit then reports EStaleRead and forces a re-read — the safe direction.
+// modifying call then reports EStaleRead and forces a re-read — the safe
+// direction.
 func (s *Conn) markKnown(resolved string, fallbackSize int64) (int64, time.Time) {
 	var (
 		size  int64

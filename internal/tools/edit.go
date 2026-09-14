@@ -90,12 +90,14 @@ func (s *Conn) MultiEdit(_ context.Context, _ *mcp.CallToolRequest, in MultiEdit
 }
 
 // editFlow is the shared §5.3/§5.4 sequence for one resolved path (the
-// caller holds the per-path session lock):
+// caller holds the per-path session lock); write.go's Write runs the same
+// fence at steps 2 and 4 for existing targets:
 //
 //  1. stat + read the current bytes (ENOENT → ENotExist, directory →
 //     EIsDir);
-//  2. compare against the session marker — never read → EUnreadWrite,
-//     changed since read → EStaleRead;
+//  2. compare against the session marker — never read → the never-read
+//     EStaleRead variant, changed since read → the stale variant (one
+//     sentinel, one remedy: read, then write);
 //  3. apply the caller's pure edit function in memory (all-or-nothing);
 //  4. re-stat: if mtime/size moved since step 1, the file changed under us
 //     → EStaleRead, nothing written;
@@ -131,7 +133,7 @@ func (s *Conn) editFlow(resolved string, apply func(content []byte) ([]byte, err
 
 	switch s.Sess.Compare(resolved, cur.size, cur.mtime) {
 	case session.StatusUnknown:
-		return errmsg.EUnreadWrite(resolved)
+		return errmsg.EStaleReadNeverRead(resolved)
 	case session.StatusStale:
 		return errmsg.EStaleRead(resolved)
 	}

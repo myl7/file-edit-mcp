@@ -249,17 +249,18 @@ func runHTTP(ctx context.Context, shared *tools.Shared, logger *slog.Logger, add
 // the token's tools.Conn, built outside the callback and bound into the
 // closure, on it. The token IS the session identity (§0): one Conn per
 // token restores the cross-client isolation statelessness removed — a file
-// read under token A does not authorize a write under token B
-// (EUnreadWrite is per token), while EStaleRead still compares against the
-// file's CURRENT state, so ANY writer — another token or an out-of-band
-// disk change — stales every other token's marker for that path (the
-// atomic temp+rename write makes cross-token same-file races safe: the
-// loser's pre-write re-stat sees the moved size/mtime and gets EStaleRead,
-// never a silent overwrite). Within one token the markers persist across
-// stateless requests (a per-callback Conn would reset them and fail every
-// write with EUnreadWrite) and reset on process restart. Register is pure
-// wiring (no Conn state, idempotent per server), and the Conn's marker/lock
-// maps are mutex-guarded, so overlapping requests sharing it are safe.
+// read under token A does not authorize a write under token B (the
+// never-read EStaleRead variant is per token), while the stale variant
+// still compares against the file's CURRENT state, so ANY writer — another
+// token or an out-of-band disk change — stales every other token's marker
+// for that path (the atomic temp+rename write makes cross-token same-file
+// races safe: the loser's pre-write re-stat sees the moved size/mtime and
+// gets EStaleRead, never a silent overwrite). Within one token the markers
+// persist across stateless requests (a per-callback Conn would reset them
+// and gate-reject every write until a re-read) and reset on process
+// restart. Register is pure wiring (no Conn state, idempotent per server),
+// and the Conn's marker/lock maps are mutex-guarded, so overlapping
+// requests sharing it are safe.
 //
 // One SDK handler instance per token is deliberate, not one shared handler
 // mounted N times: a *mcp.StreamableHTTPHandler carries only its GetServer

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestWriteNewFileAndMarker(t *testing.T) {
@@ -44,11 +45,45 @@ func TestWriteUnreadExisting(t *testing.T) {
 	path := filepath.Join(dir, "exists.txt")
 	writeDisk(t, path, "external\n", 0o644)
 
-	// §9 matrix row 8: exists but never read this session.
+	// §9 matrix row 8: exists but never read this session — the never-read
+	// EStaleRead variant (the gate's stale wording must NOT fire here).
 	wantErr(t, cs, "write", map[string]any{"file_path": path, "content": "x\n"},
-		"file exists but has not been read in this session", path)
+		"file has not been read in this session", path)
 	if got := diskFile(t, path); got != "external\n" {
 		t.Errorf("disk changed on rejected write: %q", got)
+	}
+}
+
+// TestWriteStaleAfterOutOfBandChange pins the unified gate on write: a
+// wholesale rewrite of a file that changed since the caller's read is
+// EStaleRead — this exact call silently succeeded before write adopted
+// edit's fence — and the remedy is the same as edit's: re-read, then write.
+func TestWriteStaleAfterOutOfBandChange(t *testing.T) {
+	cs, _, dir := startTestServer(t)
+	path := filepath.Join(dir, "stale-write.txt")
+	writeDisk(t, path, "v1\n", 0o644)
+
+	readTool(t, cs, path, nil)
+
+	// §9 matrix row 8 shape, now for write too: the file changes after the
+	// read (different size, and an explicit mtime bump so coarse-grained
+	// clocks cannot mask it).
+	writeDisk(t, path, "external editor\n", 0o644)
+	if err := os.Chtimes(path, time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr(t, cs, "write", map[string]any{"file_path": path, "content": "mine\n"},
+		"file changed since last read", path)
+	if got := diskFile(t, path); got != "external editor\n" {
+		t.Errorf("disk changed on rejected write: %q", got)
+	}
+
+	// Re-read re-arms the gate: the same wholesale write now goes through.
+	readTool(t, cs, path, nil)
+	wantOK(t, cs, "write", map[string]any{"file_path": path, "content": "mine\n"})
+	if got := diskFile(t, path); got != "mine\n" {
+		t.Errorf("disk after re-read + write = %q, want %q", got, "mine\n")
 	}
 }
 

@@ -69,9 +69,10 @@ func TestEditUnread(t *testing.T) {
 	path := filepath.Join(dir, "unread.txt")
 	writeDisk(t, path, "data\n", 0o644)
 
+	// The never-read EStaleRead variant (the same rejection write reports).
 	wantErr(t, cs, "edit", map[string]any{
 		"file_path": path, "old_string": "data", "new_string": "x",
-	}, "file exists but has not been read in this session", path)
+	}, "file has not been read in this session", path)
 }
 
 func TestEditStaleRead(t *testing.T) {
