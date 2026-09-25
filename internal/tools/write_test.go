@@ -3,12 +3,25 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// writeAckJSON mirrors writeAck for decoding a success text block (the ack
+// JSON): substring-matching the raw text cannot work for Warning, whose
+// payload contains characters JSON escapes.
+type writeAckJSON struct {
+	BytesWritten int64  `json:"bytes_written"`
+	Warning      string `json:"warning"`
+}
 
 func TestWriteNewFileAndMarker(t *testing.T) {
 	cs, _, dir := startTestServer(t)
@@ -204,5 +217,114 @@ func TestWriteRecoverAfterInjection(t *testing.T) {
 	wantOK(t, cs, "write", map[string]any{"file_path": path, "content": "c\n"})
 	if got := diskFile(t, path); got != "c\n" {
 		t.Errorf("disk after recovery = %q", got)
+	}
+}
+
+// TestWriteContentWarningCorrupted (§5.7): a write whose content carries
+// real U+0008/U+000B (the upstream-escape-corruption signature) succeeds
+// unchanged, but the success ack carries the warning — and the same warning
+// is mirrored into structuredContent. The disk bytes are exactly what was
+// sent; the write itself is never affected.
+func TestWriteContentWarningCorrupted(t *testing.T) {
+	cs, _, dir := startTestServer(t)
+	path := filepath.Join(dir, "corrupted.txt")
+	// Line 2: the 12-rune prefix "R_i - R_f = " puts the U+0008 at col 13
+	// and the U+000B after "eta_i (R_m - R_f) + " at col 34.
+	content := "line one\nR_i - R_f = \x08eta_i (R_m - R_f) + \x0bepsilon_i\n"
+
+	text := wantOK(t, cs, "write", map[string]any{"file_path": path, "content": content})
+	var ack writeAckJSON
+	if err := json.Unmarshal([]byte(text), &ack); err != nil {
+		t.Fatalf("write result is not writeAck JSON: %v (%s)", err, text)
+	}
+	if !strings.HasPrefix(ack.Warning, "content warning: content contains") {
+		t.Errorf("Warning = %q, want prefix %q", ack.Warning, "content warning: content contains")
+	}
+	if !strings.Contains(ack.Warning, "U+0008 (BACKSPACE) at line 2 col 13") {
+		t.Errorf("Warning %q missing the U+0008 position", ack.Warning)
+	}
+	if !strings.Contains(ack.Warning, "U+000B (LINE TABULATION)") {
+		t.Errorf("Warning %q missing the U+000B group", ack.Warning)
+	}
+	if !strings.Contains(ack.Warning, "U+000B (LINE TABULATION) at line 2 col 34") {
+		t.Errorf("Warning %q missing the U+000B position", ack.Warning)
+	}
+	if ack.BytesWritten != int64(len(content)) {
+		t.Errorf("BytesWritten = %d, want %d", ack.BytesWritten, len(content))
+	}
+	if got := diskFile(t, path); got != content {
+		t.Errorf("disk = %q, want the sent bytes verbatim %q (§5.7: never rewritten)", got, content)
+	}
+
+	// The SDK mirrors the ack into structuredContent: the warning must ride
+	// there too (driven with cs.CallTool directly, as callTool does).
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "write",
+		Arguments: map[string]any{"file_path": path, "content": content},
+	})
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected tool error on re-write: %v", res.Content)
+	}
+	sc, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any", res.StructuredContent)
+	}
+	if got, want := sc["warning"], ack.Warning; got != want {
+		t.Errorf("structuredContent warning = %v, want %q", got, want)
+	}
+	if residue := tempResidue(t, dir); len(residue) != 0 {
+		t.Errorf("temp residue after warned write: %v", residue)
+	}
+}
+
+// TestWriteCleanLatexNoWarning (§5.7): literal backslash escapes — the text
+// the caller meant to send — produce no warning at all.
+func TestWriteCleanLatexNoWarning(t *testing.T) {
+	cs, _, dir := startTestServer(t)
+	path := filepath.Join(dir, "clean.tex")
+	content := "$\n\\beta_i + \\varepsilon_i\n$$" // literal backslashes at runtime
+
+	text := wantOK(t, cs, "write", map[string]any{"file_path": path, "content": content})
+	if strings.Contains(text, "warning") {
+		t.Errorf("clean write text mentions warning: %s", text)
+	}
+	var ack writeAckJSON
+	if err := json.Unmarshal([]byte(text), &ack); err != nil {
+		t.Fatalf("write result is not writeAck JSON: %v (%s)", err, text)
+	}
+	if ack.Warning != "" {
+		t.Errorf("Warning = %q, want empty", ack.Warning)
+	}
+}
+
+// TestWriteNormalTextNoWarning (§5.7): tabs, newlines, carriage returns and
+// ordinary bracket/underscore notation are never suspicious — absence is
+// asserted on the raw ack text, where the omitempty field is exact.
+func TestWriteNormalTextNoWarning(t *testing.T) {
+	cs, _, dir := startTestServer(t)
+
+	tabRich := filepath.Join(dir, "tabs.txt")
+	text := wantOK(t, cs, "write", map[string]any{
+		"file_path": tabRich, "content": "a\tb\nc\td\r\ne\n",
+	})
+	if strings.Contains(text, "warning") {
+		t.Errorf("tab/newline-rich write reported a warning: %s", text)
+	}
+
+	// Existing target through the freshness fence: same absence.
+	bracket := filepath.Join(dir, "bracket.txt")
+	writeDisk(t, bracket, "old\n", 0o644)
+	readTool(t, cs, bracket, nil)
+	text = wantOK(t, cs, "write", map[string]any{
+		"file_path": bracket, "content": "alpha_i = [x]\n",
+	})
+	if strings.Contains(text, "warning") {
+		t.Errorf("plain [x]/alpha_i write reported a warning: %s", text)
+	}
+	if got := diskFile(t, bracket); got != "alpha_i = [x]\n" {
+		t.Errorf("disk = %q", got)
 	}
 }

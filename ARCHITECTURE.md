@@ -69,6 +69,7 @@ cmd/file-edit-mcp/main.go        入口：flag 解析、stdio server 装配
 internal/pathguard/              路径校验管线（纯逻辑，可穷举测试）
 internal/editengine/             Edit/MultiEdit 纯函数引擎（字节精确匹配）
 internal/lineio/                 Read 的行切分、截断、行号、footer
+internal/contentwarn/            写入内容可疑控制字符检测 + 告警文案（write/edit/multi_edit 公共，§5.7）
 internal/session/                会话内已读跟踪 + 每路径互斥
 internal/cifsops/                errno 分类、退避重试、os.Root 池
 internal/tools/                  六个 MCP 工具 handler（组装层）
@@ -185,6 +186,25 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
   结果形状一致；工具描述里写明性能提示「优先用 path 收窄范围」。
 - 执行超时 120s：到时杀进程，返回已得部分并声明 `search timed out; results may be incomplete`。
 - content 行格式保持 rg 原样 `path:line:text`。
+
+### 5.7 内容告警（write/edit/multi_edit 公共行为）
+
+三个修改工具对**收到的新写入文本**做可疑控制字符检测，结果以成功 ack 里的可选字段
+`warning`（string，`omitempty`，干净写入时输出与从前逐字节相同）附带给模型；检测恒开、
+无配置，**绝不阻断或改写落盘内容**——文件按收到的字节原样写入。
+
+- 检测集：C0 控制字符（U+0000–U+001F）中排除 `\t`(09)、`\n`(0A)、`\r`(0D) 的全部，
+  外加 U+007F (DELETE)——即 `\b`→U+0008、`\v`→U+000B、`\f`→U+000C 一类「上游转义
+  被提前解释」的残留形状。位置 1-based：行按 `\n` 切、列按 rune 计；按码点分组，全部
+  分组合计最多列 5 处，超出折叠为 `+N more`。
+- 扫描对象：write 的 `content`、edit 的 `new_string`、multi_edit 的各 `edits[i].new_string`
+  （告警按 1-based `edit #i` 归属）。**不扫 `old_string`**：它来自已读文件，对既有损坏
+  每次编辑重复告警只是噪音。
+- 文案（英文，`internal/contentwarn` 是唯一组装点）：只声称「很可能在到达本工具之前被
+  上游转义损坏」，**绝不声称服务器造成损坏**；明示「文件按收到内容原样写入」；给出可
+  操作下一步（重新 read 核对、必要时修正转义重写）。不回显原文，只报码点、名称、行列。
+- 错误结果不附带 warning（§6 目录文案独占错误面）；operator 侧另有 `slog` Warn 日志
+  （path + warning 全文）。
 
 ## 6. 错误目录（errmsg 包，唯一文案来源）
 

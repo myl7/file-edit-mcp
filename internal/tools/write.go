@@ -18,6 +18,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/myl7/file-edit-mcp/internal/contentwarn"
 	"github.com/myl7/file-edit-mcp/internal/errmsg"
 	"github.com/myl7/file-edit-mcp/internal/session"
 )
@@ -31,10 +32,14 @@ const tempPrefix = ".file-edit-mcp-"
 // possible (O_EXCL loop), practically never hit twice.
 const tempAttempts = 8
 
-// writeAck is the (informal) structured output of write: no shape is
-// specified in §5, so Out stays `any` and this is pure information.
+// writeAck is the (informal) structured output of write: §5 still specifies
+// no output shape (BytesWritten stays informal), except the §5.7 warning
+// field below, so Out stays `any`.
 type writeAck struct {
 	BytesWritten int64 `json:"bytes_written"`
+	// Warning is the §5.7 content warning: non-empty when content contained
+	// suspicious control characters. The write itself is never affected.
+	Warning string `json:"warning,omitempty"`
 }
 
 // Write implements the write tool (§5.2): create-or-rewrite, never append.
@@ -162,7 +167,15 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 	// §5.2: a successful write means the content is known — record the
 	// marker (edits may follow without a fresh read).
 	s.markKnown(resolved, int64(len(in.Content)))
-	return nil, any(writeAck{BytesWritten: int64(len(in.Content))}), nil
+
+	// §5.7: on the success path only (errors keep their §6 catalog surface),
+	// scan the received content for suspicious control characters and ride
+	// the warning on the ack; the write above is untouched either way.
+	warning := contentwarn.Render("content", contentwarn.Check(in.Content))
+	if warning != "" {
+		s.log().Warn("suspicious content in write", "path", resolved, "warning", warning)
+	}
+	return nil, any(writeAck{BytesWritten: int64(len(in.Content)), Warning: warning}), nil
 }
 
 // markKnown records a fresh post-write marker for resolved. If the stat

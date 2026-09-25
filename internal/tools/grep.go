@@ -327,15 +327,15 @@ func (s *Conn) grepFallbackFile(re *regexp.Regexp, absPath string, col *grepColl
 //     context lines, and a bare "--" between disjoint context groups,
 //     including across file boundaries.
 type grepCollector struct {
-	mode        string
+	mode         string
 	contextLines int
-	lines       []string
+	lines        []string
 
 	// content-mode state for the file being scanned.
-	curPath  string
-	texts    []string
-	matches  map[int]bool
-	emitted  bool
+	curPath string
+	texts   []string
+	matches map[int]bool
+	emitted bool
 }
 
 // line records one scanned line (matched flag per mode).

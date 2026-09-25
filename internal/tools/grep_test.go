@@ -101,84 +101,84 @@ func grepFixture(t *testing.T, dir string) {
 
 func TestBuildRGArgs(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		in   GrepInput
-		mode string
+		name  string
+		in    GrepInput
+		mode  string
 		roots []string
-		want []string
+		want  []string
 	}{
 		{
-			name: "defaults: files_with_matches",
-			in:   GrepInput{Pattern: "x"},
-			mode: grepModeFiles,
+			name:  "defaults: files_with_matches",
+			in:    GrepInput{Pattern: "x"},
+			mode:  grepModeFiles,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-l", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-l", "-e", "x", "/r"},
 		},
 		{
-			name: "content adds -n",
-			in:   GrepInput{Pattern: "x"},
-			mode: grepModeOutput,
+			name:  "content adds -n",
+			in:    GrepInput{Pattern: "x"},
+			mode:  grepModeOutput,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-n", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-n", "-e", "x", "/r"},
 		},
 		{
-			name: "count adds -c",
-			in:   GrepInput{Pattern: "x"},
-			mode: grepModeCount,
+			name:  "count adds -c",
+			in:    GrepInput{Pattern: "x"},
+			mode:  grepModeCount,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-c", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-c", "-e", "x", "/r"},
 		},
 		{
-			name: "case_insensitive adds -i",
-			in:   GrepInput{Pattern: "x", CaseInsensitive: true},
-			mode: grepModeFiles,
+			name:  "case_insensitive adds -i",
+			in:    GrepInput{Pattern: "x", CaseInsensitive: true},
+			mode:  grepModeFiles,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-l", "-i", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-l", "-i", "-e", "x", "/r"},
 		},
 		{
-			name: "context in content mode adds -C N",
-			in:   GrepInput{Pattern: "x", Context: 2},
-			mode: grepModeOutput,
+			name:  "context in content mode adds -C N",
+			in:    GrepInput{Pattern: "x", Context: 2},
+			mode:  grepModeOutput,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-n", "-C", "2", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-n", "-C", "2", "-e", "x", "/r"},
 		},
 		{
-			name: "context outside content mode adds nothing (rejected by the handler)",
-			in:   GrepInput{Pattern: "x", Context: 1},
-			mode: grepModeFiles,
+			name:  "context outside content mode adds nothing (rejected by the handler)",
+			in:    GrepInput{Pattern: "x", Context: 1},
+			mode:  grepModeFiles,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-l", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-l", "-e", "x", "/r"},
 		},
 		{
-			name: "glob adds one --glob pair",
-			in:   GrepInput{Pattern: "x", Glob: "*.py"},
-			mode: grepModeFiles,
+			name:  "glob adds one --glob pair",
+			in:    GrepInput{Pattern: "x", Glob: "*.py"},
+			mode:  grepModeFiles,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-l", "--glob", "*.py", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-l", "--glob", "*.py", "-e", "x", "/r"},
 		},
 		{
-			name: "exclusion glob is passed through as-is",
-			in:   GrepInput{Pattern: "x", Glob: "!skip/**"},
-			mode: grepModeFiles,
+			name:  "exclusion glob is passed through as-is",
+			in:    GrepInput{Pattern: "x", Glob: "!skip/**"},
+			mode:  grepModeFiles,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-l", "--glob", "!skip/**", "-e", "x", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-l", "--glob", "!skip/**", "-e", "x", "/r"},
 		},
 		{
-			name: "multiple roots become positional paths",
-			in:   GrepInput{Pattern: "x"},
-			mode: grepModeFiles,
+			name:  "multiple roots become positional paths",
+			in:    GrepInput{Pattern: "x"},
+			mode:  grepModeFiles,
 			roots: []string{"/r1", "/r2"},
-			want: []string{"--with-filename", "--no-heading", "-l", "-e", "x", "/r1", "/r2"},
+			want:  []string{"--with-filename", "--no-heading", "-l", "-e", "x", "/r1", "/r2"},
 		},
 		{
 			// A dash-leading pattern must stay a pattern: on -e it cannot be
 			// mistaken for an rg flag (which would otherwise turn the search
 			// root into the pattern and scan rg's own cwd).
-			name: "dash-leading pattern is safe on -e",
-			in:   GrepInput{Pattern: "-foo"},
-			mode: grepModeFiles,
+			name:  "dash-leading pattern is safe on -e",
+			in:    GrepInput{Pattern: "-foo"},
+			mode:  grepModeFiles,
 			roots: []string{"/r"},
-			want: []string{"--with-filename", "--no-heading", "-l", "-e", "-foo", "/r"},
+			want:  []string{"--with-filename", "--no-heading", "-l", "-e", "-foo", "/r"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

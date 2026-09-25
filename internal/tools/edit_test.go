@@ -4,6 +4,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,14 @@ import (
 	"testing"
 	"time"
 )
+
+// editAckJSON mirrors editAck for decoding a success text block (the ack
+// JSON): the Warning payload contains characters JSON escapes, so raw-text
+// substring matching cannot assert it.
+type editAckJSON struct {
+	Matches int    `json:"matches"`
+	Warning string `json:"warning"`
+}
 
 func TestEditBasicAndMarkerRefresh(t *testing.T) {
 	cs, _, dir := startTestServer(t)
@@ -287,4 +296,123 @@ func TestConcurrentEditsSameFile(t *testing.T) {
 	if residue := tempResidue(t, dir); len(residue) != 0 {
 		t.Errorf("temp residue after concurrent edits: %v", residue)
 	}
+}
+
+// TestEditNewStringWarning (§5.7): a corrupted new_string is flagged in the
+// success ack while the replacement lands byte-exact; a control character
+// riding in old_string (scan scope is new_string only) is never reported.
+func TestEditNewStringWarning(t *testing.T) {
+	cs, _, dir := startTestServer(t)
+
+	// Corrupted insertion: "corrupted " is 10 runes, so U+0008 sits at
+	// line 1 col 11 of new_string.
+	path := filepath.Join(dir, "edit-warn.txt")
+	writeDisk(t, path, "x\n", 0o644)
+	readTool(t, cs, path, nil)
+	text := wantOK(t, cs, "edit", map[string]any{
+		"file_path": path, "old_string": "x", "new_string": "corrupted \x08eta",
+	})
+	var ack editAckJSON
+	if err := json.Unmarshal([]byte(text), &ack); err != nil {
+		t.Fatalf("edit result is not editAck JSON: %v (%s)", err, text)
+	}
+	if !strings.HasPrefix(ack.Warning, "content warning: new_string contains") {
+		t.Errorf("Warning = %q, want prefix %q", ack.Warning, "content warning: new_string contains")
+	}
+	if !strings.Contains(ack.Warning, "U+0008 (BACKSPACE) at line 1 col 11") {
+		t.Errorf("Warning %q missing the U+0008 position", ack.Warning)
+	}
+	if got, want := diskFile(t, path), "corrupted \x08eta\n"; got != want {
+		t.Errorf("disk = %q, want %q (edit semantics unchanged)", got, want)
+	}
+
+	// old_string scope: the file's tab is matched by an old_string that
+	// contains it; the clean new_string means no warning may appear.
+	tab := filepath.Join(dir, "edit-oldstr-tab.txt")
+	writeDisk(t, tab, "a\tb\n", 0o644)
+	readTool(t, cs, tab, nil)
+	text = wantOK(t, cs, "edit", map[string]any{
+		"file_path": tab, "old_string": "a\tb", "new_string": "ab",
+	})
+	if strings.Contains(text, "warning") {
+		t.Errorf("old_string control character reported a warning: %s", text)
+	}
+	if got := diskFile(t, tab); got != "ab\n" {
+		t.Errorf("disk = %q, want %q", got, "ab\n")
+	}
+}
+
+// TestMultiEditWarningAttribution (§5.7): each edit's new_string is scanned
+// and attributed by 1-based edit index; clean edits contribute nothing and
+// corrupted ones join into the single ack warning with "; ".
+func TestMultiEditWarningAttribution(t *testing.T) {
+	cs, _, dir := startTestServer(t)
+
+	t.Run("only second corrupted", func(t *testing.T) {
+		path := filepath.Join(dir, "multi-warn-2.txt")
+		writeDisk(t, path, "a\nb\n", 0o644)
+		readTool(t, cs, path, nil)
+		text := wantOK(t, cs, "multi_edit", map[string]any{
+			"file_path": path,
+			"edits": []map[string]any{
+				{"old_string": "a", "new_string": "A"},
+				{"old_string": "A\nb", "new_string": "X\x08Y"},
+			},
+		})
+		var ack editAckJSON
+		if err := json.Unmarshal([]byte(text), &ack); err != nil {
+			t.Fatalf("multi_edit result is not editAck JSON: %v (%s)", err, text)
+		}
+		if ack.Matches != 2 {
+			t.Errorf("Matches = %d, want 2", ack.Matches)
+		}
+		if !strings.Contains(ack.Warning, "content warning: edit #2 new_string contains") {
+			t.Errorf("Warning %q missing the edit #2 attribution", ack.Warning)
+		}
+		if strings.Contains(ack.Warning, "edit #1") {
+			t.Errorf("Warning %q mentions the clean edit #1", ack.Warning)
+		}
+		if !strings.Contains(ack.Warning, "U+0008 (BACKSPACE) at line 1 col 2") {
+			t.Errorf("Warning %q missing the U+0008 position", ack.Warning)
+		}
+		if got, want := diskFile(t, path), "X\x08Y\n"; got != want {
+			t.Errorf("disk = %q, want %q (fully applied)", got, want)
+		}
+	})
+
+	t.Run("both corrupted joined", func(t *testing.T) {
+		path := filepath.Join(dir, "multi-warn-both.txt")
+		writeDisk(t, path, "a\nb\n", 0o644)
+		readTool(t, cs, path, nil)
+		text := wantOK(t, cs, "multi_edit", map[string]any{
+			"file_path": path,
+			"edits": []map[string]any{
+				{"old_string": "a", "new_string": "\x08one"},
+				{"old_string": "b", "new_string": "\x0btwo"},
+			},
+		})
+		var ack editAckJSON
+		if err := json.Unmarshal([]byte(text), &ack); err != nil {
+			t.Fatalf("multi_edit result is not editAck JSON: %v (%s)", err, text)
+		}
+		if ack.Matches != 2 {
+			t.Errorf("Matches = %d, want 2", ack.Matches)
+		}
+		first := strings.Index(ack.Warning, "content warning: edit #1 new_string contains")
+		second := strings.Index(ack.Warning, "content warning: edit #2 new_string contains")
+		if first < 0 || second < 0 {
+			t.Fatalf("Warning %q missing an edit attribution", ack.Warning)
+		}
+		if first > second {
+			t.Errorf("Warning %q attributes edit #2 before edit #1", ack.Warning)
+		}
+		// The two sentences are joined by "; " (the first ends with "…escapes"
+		// and the second begins right after "; ").
+		if got := ack.Warning[first:second]; !strings.HasSuffix(got, "corrected escapes; ") {
+			t.Errorf("Warning parts joined by %q, want a trailing %q", "; ", "; ")
+		}
+		if got, want := diskFile(t, path), "\x08one\n\x0btwo\n"; got != want {
+			t.Errorf("disk = %q, want %q (fully applied)", got, want)
+		}
+	})
 }

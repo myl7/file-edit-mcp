@@ -7,21 +7,29 @@ package tools
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/myl7/file-edit-mcp/internal/contentwarn"
 	"github.com/myl7/file-edit-mcp/internal/editengine"
 	"github.com/myl7/file-edit-mcp/internal/errmsg"
 	"github.com/myl7/file-edit-mcp/internal/session"
 )
 
 // editAck is the (informal) structured output of edit/multi_edit; §5
-// specifies no output shape, so Out stays `any`.
+// specifies no output shape except the §5.7 warning field below, so Out
+// stays `any`.
 type editAck struct {
 	// Matches counts replaced occurrences (edit) or applied edits
 	// (multi_edit).
 	Matches int `json:"matches"`
+	// Warning is the §5.7 content warning: non-empty when the scanned
+	// new_string text contained suspicious control characters. The edit
+	// itself is never affected.
+	Warning string `json:"warning,omitempty"`
 }
 
 // Edit implements the edit tool (§5.3): one byte-exact replacement with
@@ -51,7 +59,15 @@ func (s *Conn) Edit(_ context.Context, _ *mcp.CallToolRequest, in EditInput) (*m
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, any(editAck{Matches: matches}), nil
+	// §5.7: on the success path only (errors above keep their §6 catalog
+	// surface), scan the received new_string — old_string comes from the
+	// already-read file and is deliberately not scanned (§5.7). The edit
+	// itself is untouched either way.
+	warning := contentwarn.Render("new_string", contentwarn.Check(in.NewString))
+	if warning != "" {
+		s.log().Warn("suspicious content in edit", "path", resolved, "warning", warning)
+	}
+	return nil, any(editAck{Matches: matches, Warning: warning}), nil
 }
 
 // MultiEdit implements the multi_edit tool (§5.4): edits applied in array
@@ -86,7 +102,22 @@ func (s *Conn) MultiEdit(_ context.Context, _ *mcp.CallToolRequest, in MultiEdit
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, any(editAck{Matches: len(in.Edits)}), nil
+	// §5.7: on the success path only (errors keep their §6 catalog surface,
+	// including EEditIndex for edit #i), scan each edit's new_string — never
+	// old_string — and attribute findings to the 1-based edit index; the
+	// parts join into the single ack warning and the edits above are
+	// untouched either way.
+	var parts []string
+	for i, e := range in.Edits {
+		if w := contentwarn.Render(fmt.Sprintf("edit #%d new_string", i+1), contentwarn.Check(e.NewString)); w != "" {
+			parts = append(parts, w)
+		}
+	}
+	warning := strings.Join(parts, "; ")
+	if warning != "" {
+		s.log().Warn("suspicious content in multi_edit", "path", resolved, "warning", warning)
+	}
+	return nil, any(editAck{Matches: len(in.Edits), Warning: warning}), nil
 }
 
 // editFlow is the shared §5.3/§5.4 sequence for one resolved path (the
