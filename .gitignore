@@ -3,3 +3,4 @@ file-edit-mcp-linux-*/
 dist/
 *.test
 .coverage
+.zcode/

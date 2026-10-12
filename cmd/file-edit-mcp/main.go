@@ -1,5 +1,6 @@
 // Command file-edit-mcp is an MCP server exposing file read/write/edit,
-// glob, and grep tools restricted to the directories allowed via --allow.
+// glob, grep, mkdir, and image-upload tools restricted to the directories
+// allowed via --allow.
 //
 // Two transports (ARCHITECTURE §0): stdio (the default, one process = one
 // client connection) and streamable HTTP (a resident, STATELESS server

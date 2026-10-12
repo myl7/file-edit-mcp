@@ -52,12 +52,19 @@ type writeAck struct {
 // exists with no read behind it), and the content lands via the atomic
 // temp+rename path. The whole operation runs under the per-path session
 // lock (§7).
-func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (*mcp.CallToolResult, any, error) {
+func (s *Conn) Write(ctx context.Context, _ *mcp.CallToolRequest, in WriteInput) (*mcp.CallToolResult, any, error) {
 	resolved, err := s.Guard.Validate(in.FilePath)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// §7 order: process-level path lock, then the per-path session lock
+	// (the §5.9 addition; see read.go for the rationale).
+	release, err := s.Shared.plocks.LockContext(ctx, resolved)
+	if err != nil {
+		return nil, nil, errmsg.ETimeout("write")
+	}
+	defer release()
 	unlock := s.Sess.LockFile(resolved)
 	defer unlock()
 
@@ -70,25 +77,23 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 		mtime  time.Time
 	)
 	err = s.Retry.Do(func() error {
-		root, rel, err := s.Roots.Resolve(resolved)
-		if err != nil {
-			return err
-		}
-		info, err := root.Stat(rel)
-		if err == nil {
-			if info.IsDir() {
-				return errmsg.EIsDir(resolved)
+		return s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+			info, err := root.Stat(rel)
+			if err == nil {
+				if info.IsDir() {
+					return errmsg.EIsDir(resolved)
+				}
+				exists, mode, size, mtime = true, info.Mode().Perm(), info.Size(), info.ModTime()
+				return nil
 			}
-			exists, mode, size, mtime = true, info.Mode().Perm(), info.Size(), info.ModTime()
-			return nil
-		}
-		if errors.Is(err, fs.ErrNotExist) {
-			// A missing parent was already rejected by pathguard (§3 step 8
-			// → EParentMissing); reaching here means only the file is new.
-			exists = false
-			return nil
-		}
-		return err
+			if errors.Is(err, fs.ErrNotExist) {
+				// A missing parent was already rejected by pathguard (§3 step 8
+				// → EParentMissing); reaching here means only the file is new.
+				exists = false
+				return nil
+			}
+			return err
+		})
 	})
 	if err != nil {
 		return nil, nil, mapFSErr(err, resolved)
@@ -124,22 +129,20 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 		// the O_EXCL and the call reports the never-read EStaleRead variant
 		// (the file now exists with no read behind it).
 		err = s.Retry.Do(func() error {
-			root, rel, err := s.Roots.Resolve(resolved)
-			if err != nil {
-				return err
-			}
-			f, err := root.OpenFile(rel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-			if err != nil {
-				if errors.Is(err, fs.ErrExist) {
-					return errmsg.EStaleReadNeverRead(resolved)
+			return s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+				f, err := root.OpenFile(rel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+				if err != nil {
+					if errors.Is(err, fs.ErrExist) {
+						return errmsg.EStaleReadNeverRead(resolved)
+					}
+					if errors.Is(err, fs.ErrNotExist) {
+						// The parent vanished between validation and now.
+						return errmsg.EParentMissing(filepath.Dir(resolved))
+					}
+					return err
 				}
-				if errors.Is(err, fs.ErrNotExist) {
-					// The parent vanished between validation and now.
-					return errmsg.EParentMissing(filepath.Dir(resolved))
-				}
-				return err
-			}
-			return f.Close()
+				return f.Close()
+			})
 		})
 		if err != nil {
 			return nil, nil, mapFSErr(err, resolved)
@@ -154,11 +157,9 @@ func (s *Conn) Write(_ context.Context, _ *mcp.CallToolRequest, in WriteInput) (
 			// EStaleRead variant against a file the caller never saw. Best
 			// effort.
 			_ = s.Retry.Do(func() error {
-				root, rel, err := s.Roots.Resolve(resolved)
-				if err != nil {
-					return err
-				}
-				return root.Remove(rel)
+				return s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+					return root.Remove(rel)
+				})
 			})
 		}
 		return nil, nil, mapFSErr(err, resolved)
@@ -189,11 +190,16 @@ func (s *Conn) markKnown(resolved string, fallbackSize int64) (int64, time.Time)
 		mtime time.Time
 	)
 	st, err := runFS(s, resolved, func() (os.FileInfo, error) {
-		root, rel, err := s.Roots.Resolve(resolved)
-		if err != nil {
-			return nil, err
-		}
-		return root.Stat(rel)
+		var info os.FileInfo
+		err := s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+			i, err := root.Stat(rel)
+			if err != nil {
+				return err
+			}
+			info = i
+			return nil
+		})
+		return info, err
 	})
 	if err != nil {
 		s.log().Warn("post-write stat failed; recording stale marker", "path", resolved, "err", err)
@@ -208,11 +214,16 @@ func (s *Conn) markKnown(resolved string, fallbackSize int64) (int64, time.Time)
 // statFile stats resolved through the Root/retry pipeline.
 func (s *Conn) statFile(resolved string) (size int64, mtime time.Time, mode os.FileMode, err error) {
 	st, err := runFS(s, resolved, func() (os.FileInfo, error) {
-		root, rel, err := s.Roots.Resolve(resolved)
-		if err != nil {
-			return nil, err
-		}
-		return root.Stat(rel)
+		var info os.FileInfo
+		err := s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+			i, err := root.Stat(rel)
+			if err != nil {
+				return err
+			}
+			info = i
+			return nil
+		})
+		return info, err
 	})
 	if err != nil {
 		return 0, time.Time{}, 0, err
@@ -233,43 +244,40 @@ func (s *Conn) statFile(resolved string) (size int64, mtime time.Time, mode os.F
 // no os.CreateTemp/os.Rename fallback is needed.
 func (s *Conn) atomicWrite(resolved string, data []byte, mode os.FileMode) error {
 	return s.Retry.Do(func() error {
-		root, rel, err := s.Roots.Resolve(resolved)
-		if err != nil {
-			return err
-		}
-
-		tmpRel, f, err := createTempIn(root, filepath.Dir(rel))
-		if err != nil {
-			return err
-		}
-		keep := false
-		defer func() {
-			if !keep {
-				// §5.2: failure cleans the temp file; the target is
-				// untouched because the rename never ran. Best effort.
-				_ = root.Remove(tmpRel)
+		return s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+			tmpRel, f, err := createTempIn(root, filepath.Dir(rel))
+			if err != nil {
+				return err
 			}
-		}()
+			keep := false
+			defer func() {
+				if !keep {
+					// §5.2: failure cleans the temp file; the target is
+					// untouched because the rename never ran. Best effort.
+					_ = root.Remove(tmpRel)
+				}
+			}()
 
-		if _, err := f.Write(data); err != nil {
-			_ = f.Close()
-			return err
-		}
-		// fsync is best effort: on CIFS it is unreliable, and §5.2 defines
-		// atomicity by the rename, not by durability.
-		_ = f.Sync()
-		if err := f.Close(); err != nil {
-			return err
-		}
-		if err := root.Chmod(tmpRel, mode); err != nil {
-			// §5.2: mode on CIFS is decorative — best effort, never fatal.
-			s.log().Debug("chmod on temp file failed", "path", resolved, "err", err)
-		}
-		if err := s.rename(root, tmpRel, rel); err != nil {
-			return err
-		}
-		keep = true
-		return nil
+			if _, err := f.Write(data); err != nil {
+				_ = f.Close()
+				return err
+			}
+			// fsync is best effort: on CIFS it is unreliable, and §5.2 defines
+			// atomicity by the rename, not by durability.
+			_ = f.Sync()
+			if err := f.Close(); err != nil {
+				return err
+			}
+			if err := root.Chmod(tmpRel, mode); err != nil {
+				// §5.2: mode on CIFS is decorative — best effort, never fatal.
+				s.log().Debug("chmod on temp file failed", "path", resolved, "err", err)
+			}
+			if err := s.rename(root, tmpRel, rel); err != nil {
+				return err
+			}
+			keep = true
+			return nil
+		})
 	})
 }
 

@@ -9,6 +9,7 @@
 package session
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -56,15 +57,76 @@ func (s Status) String() string {
 type Session struct {
 	mu      sync.Mutex
 	markers map[string]Marker
-	locks   map[string]*sync.Mutex
+	// locks serializes same-path operations (§7). A PathLocks table is
+	// safe on its own; Session wraps it only so LockFile keeps working on
+	// a Session value.
+	locks PathLocks
 }
 
 // New returns an empty Session.
 func New() *Session {
 	return &Session{
 		markers: make(map[string]Marker),
-		locks:   make(map[string]*sync.Mutex),
 	}
+}
+
+// PathLocks is a per-path mutual-exclusion table with a cancellable
+// acquire (§7). Each path gets a cap-1 channel used as a binary semaphore:
+// EMPTY means free — acquiring SENDS one token, releasing RECEIVES it
+// back. LockContext races the send against ctx.Done(), so a waiter stuck
+// behind a long holder (an upload's compare/publish section, say) gives up
+// when its budget expires instead of blocking past the deadline.
+//
+// Entries are never deleted (a deleted entry would let two concurrent
+// users of the same path hold two different locks); the set of distinct
+// paths per process is small, so retention is cheap.
+//
+// A PathLocks zero value is ready to use; safe for concurrent use by any
+// number of goroutines. The lock is NOT reentrant: never acquire the same
+// path twice from one goroutine.
+type PathLocks struct {
+	mu    sync.Mutex
+	locks map[string]chan struct{}
+}
+
+// Lock acquires the lock for path and returns the release func. It waits
+// as long as the holder keeps the path; use LockContext when the wait must
+// stay inside a deadline. The returned func must be called exactly once.
+func (t *PathLocks) Lock(path string) func() {
+	release, err := t.LockContext(context.Background(), path)
+	if err != nil {
+		// context.Background is never canceled; unreachable.
+		panic("session: Lock on Background context failed: " + err.Error())
+	}
+	return release
+}
+
+// LockContext acquires the lock for path unless ctx finishes first, in
+// which case it returns ctx.Err() and holds nothing.
+func (t *PathLocks) LockContext(ctx context.Context, path string) (func(), error) {
+	ch := t.channel(path)
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// channel returns (creating on first use) the path's semaphore channel.
+// A fresh channel is EMPTY, which is the "free" state.
+func (t *PathLocks) channel(path string) chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.locks == nil {
+		t.locks = make(map[string]chan struct{})
+	}
+	ch, ok := t.locks[path]
+	if !ok {
+		ch = make(chan struct{}, 1)
+		t.locks[path] = ch
+	}
+	return ch
 }
 
 // MarkRead records path as read at the given size and mtime, overwriting
@@ -110,30 +172,19 @@ func (s *Session) Compare(path string, size int64, mtime time.Time) Status {
 //
 // The returned func must be called exactly once. The mutex is not
 // reentrant: do not call LockFile for the same path again before unlocking.
+// LockFile waits without a deadline; new callers that need a bounded wait
+// (upload's post-download section) use PathLocks.LockContext directly.
 func (s *Session) LockFile(path string) func() {
-	s.mu.Lock()
-	if s.locks == nil {
-		s.locks = make(map[string]*sync.Mutex)
-	}
-	mu := s.locks[path]
-	if mu == nil {
-		mu = &sync.Mutex{}
-		s.locks[path] = mu
-	}
-	s.mu.Unlock()
-
-	mu.Lock()
-	return mu.Unlock
+	return s.locks.Lock(path)
 }
 
 // Forget drops the read marker for path, so the next modifying call on it
 // is rejected with the never-read EStaleRead variant until it is read
 // again.
 //
-// The per-path mutex entry is deliberately retained: deleting a mutex that
-// another goroutine still holds would let the next LockFile create a fresh
-// mutex and bypass serialization. The set of distinct paths touched per
-// session is small, so retention is cheap.
+// The per-path lock entry is deliberately retained (see PathLocks):
+// deleting a lock that another goroutine still holds would let the next
+// acquire create a fresh one and bypass serialization.
 func (s *Session) Forget(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

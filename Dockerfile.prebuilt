@@ -8,7 +8,9 @@
 #   docker push <user>/file-edit-mcp:v0.1.0
 #
 # scratch keeps the image at alpine-class size: the static binary, ripgrep,
-# and ripgrep's three shared libraries. No package manager, no shell. PATH
+# ripgrep's three shared libraries, and the CA bundle the upload tool needs
+# for outbound HTTPS (ARCHITECTURE.md §5.9/§10 — the alpine base ships
+# ca-certificates-bundle at this path). No package manager, no shell. PATH
 # must name /usr/bin, otherwise exec.LookPath cannot find rg and the grep
 # tool silently degrades to the slow in-process engine.
 FROM alpine:3.20 AS rg
@@ -19,6 +21,7 @@ COPY --from=rg /usr/bin/rg /usr/bin/rg
 COPY --from=rg /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
 COPY --from=rg /usr/lib/libpcre2-8.so.0 /usr/lib/libpcre2-8.so.0
 COPY --from=rg /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1
+COPY --from=rg /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY dist/file-edit-mcp-linux-amd64 /usr/local/bin/file-edit-mcp
 
 # Resident HTTP server form (ARCHITECTURE.md §0/§10): the binary is the

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -36,12 +37,18 @@ type editAck struct {
 // uniqueness required unless replace_all. Engine errors (ENoMatch,
 // EAmbiguous, ENoop, EEmptyOld) pass through with the §6 catalog text; the
 // resolved path is attached because the engine itself is path-free.
-func (s *Conn) Edit(_ context.Context, _ *mcp.CallToolRequest, in EditInput) (*mcp.CallToolResult, any, error) {
+func (s *Conn) Edit(ctx context.Context, _ *mcp.CallToolRequest, in EditInput) (*mcp.CallToolResult, any, error) {
 	resolved, err := s.Guard.Validate(in.FilePath)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// §7 order: process-level path lock, then session lock (§5.9 addition).
+	release, err := s.Shared.plocks.LockContext(ctx, resolved)
+	if err != nil {
+		return nil, nil, errmsg.ETimeout("edit")
+	}
+	defer release()
 	unlock := s.Sess.LockFile(resolved)
 	defer unlock()
 
@@ -74,7 +81,7 @@ func (s *Conn) Edit(_ context.Context, _ *mcp.CallToolRequest, in EditInput) (*m
 // order onto progressively modified content; any failure names the 1-based
 // edit index (the engine's EEditIndex wrapper passes through verbatim) and
 // nothing is written.
-func (s *Conn) MultiEdit(_ context.Context, _ *mcp.CallToolRequest, in MultiEditInput) (*mcp.CallToolResult, any, error) {
+func (s *Conn) MultiEdit(ctx context.Context, _ *mcp.CallToolRequest, in MultiEditInput) (*mcp.CallToolResult, any, error) {
 	resolved, err := s.Guard.Validate(in.FilePath)
 	if err != nil {
 		return nil, nil, err
@@ -83,6 +90,12 @@ func (s *Conn) MultiEdit(_ context.Context, _ *mcp.CallToolRequest, in MultiEdit
 		return nil, nil, errors.New("edits must contain at least one edit")
 	}
 
+	// §7 order: process-level path lock, then session lock (§5.9 addition).
+	release, err := s.Shared.plocks.LockContext(ctx, resolved)
+	if err != nil {
+		return nil, nil, errmsg.ETimeout("edit")
+	}
+	defer release()
 	unlock := s.Sess.LockFile(resolved)
 	defer unlock()
 
@@ -141,22 +154,23 @@ func (s *Conn) editFlow(resolved string, apply func(content []byte) ([]byte, err
 		mtime   time.Time
 	}
 	cur, err := runFS(s, resolved, func() (*snap, error) {
-		root, rel, err := s.Roots.Resolve(resolved)
-		if err != nil {
-			return nil, err
-		}
-		info, err := root.Stat(rel)
-		if err != nil {
-			return nil, err
-		}
-		if info.IsDir() {
-			return nil, errmsg.EIsDir(resolved)
-		}
-		data, err := root.ReadFile(rel)
-		if err != nil {
-			return nil, err
-		}
-		return &snap{content: data, size: info.Size(), mtime: info.ModTime()}, nil
+		var out *snap
+		err := s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+			info, err := root.Stat(rel)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return errmsg.EIsDir(resolved)
+			}
+			data, err := root.ReadFile(rel)
+			if err != nil {
+				return err
+			}
+			out = &snap{content: data, size: info.Size(), mtime: info.ModTime()}
+			return nil
+		})
+		return out, err
 	})
 	if err != nil {
 		return mapFSErr(err, resolved)

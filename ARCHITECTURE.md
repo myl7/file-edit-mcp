@@ -6,7 +6,9 @@
 ## 0. 定位与运行环境
 
 - 直连文件系统的通用 MCP server，只服务允许目录，内容形态不限。
-- 不提供 shell、进程、网络、剪贴板、截屏工具。
+- 不提供 shell、进程、剪贴板、截屏工具。网络能力只有一个例外：`upload` 工具的**受限出站
+  HTTPS 图片下载**（SSRF 边界、限额与内容校验见 §5.9）；除此之外服务端不出网，也不提供
+  任何通用网络工具。
 - 语言/框架：**Go 1.27 + 官方 SDK `github.com/modelcontextprotocol/go-sdk/mcp`**，stdio transport。
 - 传输：**stdio 与 streamable HTTP 双支持**（`--transport stdio|http`，默认 stdio 本地调试用）。
   HTTP 模式监听 `--addr`（默认 `:8080`），MCP 端点挂 `/{token}/mcp`——**token-path 鉴权**：URL
@@ -57,7 +59,9 @@
   空闲卸载导致「文件看似消失」（卸载后 stat 返回 ENOENT 属确定类，不触发 backend 重试，
   会把「没挂上」误报成「文件不存在」）。可用 `--keepalive 0` 关闭。挂载真正断开（soft 错误）
   时走 §8 的 backend 类重试 + Root 重开。
-- 内存预算：容器内常驻 RSS ≤ 20 MB；镜像 ≤ 30 MB（alpine 基底 + 静态二进制 + ripgrep）。
+- 内存预算：容器内常驻 RSS ≤ 20 MB；镜像 ≤ 30 MB（alpine 基底 + 静态二进制 + ripgrep + CA 证书包）。
+  upload 增加了 TLS 栈与下载缓冲（每 worker 32 KiB 复制缓冲 + 512 B 嗅探 + SVG 前导 64 KiB 上限，
+  均为限额常量），常驻增量预计极小但**不得假定达标**：上线验收须实测空闲/峰值/恢复后 RSS。
 - 服务对象（设计目标环境）：CIFS soft 挂载（`x-systemd.automount`，idle 600s 卸载，
   `actimeo=30`，`noperm`，`file_mode/dir_mode=0777`）。inode 由服务端提供，跨重命名不可靠，
   **禁止用 inode 做文件标识**。
@@ -72,8 +76,9 @@ internal/lineio/                 Read 的行切分、截断、行号、footer
 internal/contentwarn/            写入内容可疑控制字符检测 + 告警文案（write/edit/multi_edit 公共，§5.7）
 internal/session/                会话内已读跟踪 + 每路径互斥
 internal/cifsops/                errno 分类、退避重试、os.Root 池
-internal/tools/                  六个 MCP 工具 handler（组装层）
+internal/tools/                  八个 MCP 工具 handler（组装层）
 internal/errmsg/                 错误消息目录（唯一允许拼错误文案的地方）
+internal/imagedownload/          upload 的受限 HTTPS 下载（SSRF 策略、专用传输、图片内容校验，§5.9）
 ```
 
 每个包带自己的 `*_test.go`。测试不依赖网络、不依赖真实 CIFS。
@@ -104,15 +109,23 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 - server 为每个允许目录持有 `*os.Root`，所有文件的 open/create/stat 走 Root 方法，
   Linux 上由内核保证不越界（openat 语义），关闭「校验后打开前被换符号链接」的窗口。
 - Root 池惰性打开；遇到 backend 类错误（见 §8）时关闭并重开 Root（触发 automount 重新挂载）后重试一次。
-- `os.Root` 方法集以本机 Go 1.27 实际提供为准（`go doc os.Root` 核对）：
-  有 `Rename`/`CreateTemp` 就用；没有则退回 `os.Rename`/`os.CreateTemp`（路径已过 §3 管线），
-  残留窗口在代码注释里写明。禁止 cgo。
+  重开经 **WithRoot 租约**串行化：操作持读租约使用 Root，重开持写租约等待所有在租操作结束后再换——
+  legacy `Resolve` 裸取 Root 的形式保留（旧调用方语义），但 tools 层与 keepalive 一律走租约。
+  租约规则：租约内的 op 必须有界；**禁止**在租约内运行会触发 OnRetry（重开）的 §8 重试——
+  重试包在租约外、每次尝试各自 WithRoot。
+- `os.Root` 方法集以本机 Go 1.27 实际提供为准（`go doc os.Root` 核对）：`Rename`、`Link`、
+  `Mkdir`、`Open`、`OpenFile`、`Stat`、`Lstat`、`Chmod`、`Remove` 均在（已核实）；无 `CreateTemp`，
+  临时文件用 `OpenFile(O_WRONLY|O_CREATE|O_EXCL)` + 随机名（留在 Root 约束内，无 TOCTOU 窗口）。
+  文本写路径用 `Rename`；upload 的 no-replace 发布用 `Link`（§5.9），**禁止** `stat→Rename` 或
+  「`O_EXCL` 空占位→`Rename`」冒充无覆盖发布（两者都重开覆盖窗口）。禁止 cgo。
 - Glob/Grep 的目录遍历是只读的，走校验后的路径 + `os.ReadDir`，不要求 Root 化（可接受的残留风险，注释说明）。
 
 ## 5. 工具规格
 
-工具名：`read`、`write`、`edit`、`multi_edit`、`glob`、`grep`。
+工具名：`read`、`write`、`edit`、`multi_edit`、`glob`、`grep`、`mkdir`、`upload`。
 描述用英文，简短，每条写明：只接受绝对路径；edit 系写明 exact-match、唯一性要求、无模糊回退。
+mkdir/upload 标注 MCP tool annotations：二者均非只读、非破坏性、幂等（同内容收敛 skipped/exists）；
+upload 另标 open-world（出站下载）。
 
 ### 5.1 read
 
@@ -206,6 +219,80 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 - 错误结果不附带 warning（§6 目录文案独占错误面）；operator 侧另有 `slog` Warn 日志
   （path + warning 全文）。
 
+### 5.8 mkdir
+
+参数：`dir_path`(必)。输出：`{"dir_path": <resolved>, "status": "created"|"exists"}`。
+
+- **单层、幂等**：只创建最后一级；父目录必须已存在（§3 步 8 的新建分支即单层闸门），
+  缺父目录 → `EParentMissing`，绝不隐式 MkdirAll——更深路径由 Agent 逐层调用。
+- 已存在目录 → `exists`（含允许根本身）；已有普通文件/不适用类型 → `ENotDir`；
+  并发创建撞 EEXIST 后重新 stat 按类型收敛。权限 0755（umask/共享挂载可修饰，同 §5.2
+  「mode 装饰性」立场）。
+- 无 read marker（目录无内容新鲜度），但走同一 §7 锁序；操作预算 25s（`Retrier.DoContext`，
+  可取消退避——内核阻塞仍不可强断，见 §8）。不重建、不改权限于已存在目录。
+
+### 5.9 upload
+
+参数：`{"files": [{"url", "file_path"}, ...]}`（1–32 项；URL ≤8192 字节）。
+输出：`{"results": [...], "summary": {"created","skipped","failed"}}`，逐项按输入顺序、
+`index` 1-based；成功项带校验后的绝对路径、`bytes`、`sha256`、`content_type`；失败项带
+稳定 `error_code` + 简短目录文案；扩展名不匹配时附 `detected_content_type` +
+`suggested_extension`。**结果不回显源 URL**（签名常在 query 里）。
+
+- **状态语义**：`created` = 新建；`skipped` = 已下载并**逐字节比较**与既有目标相同（不得凭
+  存在或 ETag 判断）；`failed` = 逐项错误。**upload 永不覆盖已有目标**：内容不同 →
+  `EExistsConflict`；比较期间 size/mtime 不稳 → `ETargetChanged`（补救是重试 upload，
+  不是去 read——与 EStaleRead 的语义分界）。
+- **调用级错误**（SDK 包成 IsError、无逐项结果）：空数组/超上限/字段缺失/URL 超长 →
+  `EInvalidBatch`；进程并发批次满（4）→ `EBusy`（立即拒绝，不排队）。
+- **聚合契约**：进入批处理后一切失败逐项报告，全部输入项都有结果；**只要有 failed 项
+  IsError=true**（部分成功也为 true），且显式构造 CallToolResult 保证 Content 与
+  StructuredContent 装同一份完整 JSON——绝不抛丢失 results 的顶层 error。幂等收敛使
+  模型整批重试安全（已成功项转 skipped）。
+- **限额**（集中常量，非工具参数；资源上限而非完成保证）：批 1–32 项；每批并发下载 ≤4、
+  进程全局 ≤4；并发批次 ≤4；单图 ≤20 MiB（`LimitReader(max+1)` 强制，声明长度预拒）；
+  单图 10s（自取得下载槽起，覆盖 DNS/重定向/下载/比较/提交）；整批 25s（handler 入口起）；
+  DNS/连接/TLS/响应头分别 2s/3s/3s/5s（均受更短的整体 deadline 约束）；重定向 ≤3 跳
+  （每跳全量重查）；响应头 ≤64 KiB；每 worker 复制缓冲 32 KiB + 嗅探 512 B；SVG 根元素
+  须在前 64 KiB 出现。预算到期：停派发、取消 HTTP、汇总所有输入项（未开始项也返回超时）。
+- **SSRF 与下载策略**（`internal/imagedownload`，生产客户端不可替换为 `http.DefaultClient`）：
+  仅绝对 `https`（拒绝 userinfo/fragment/空 host/控制字符/IPv6 zone/非 443 端口/http 降级/
+  data:URL）；单标签与内部后缀名直接拒（名称检查只是补充，**按解析 IP 判定**）；DNS 整组
+  A+AAAA 全部须公网（混合公私答案整组拒绝），拒绝表 = 内建判定（loopback/private/
+  link-local/multicast/unspecified）+ IANA 特殊用途前缀显式表（CGNAT、TEST-NET、基准、
+  保留 240/4、广播、NAT64、Teredo、6to4、6bone、SRv6、discard、文档段等）；**每条新连接
+  只解析一次并直接拨向已校验 IP 字面量**（保留原域名做 SNI/证书校验），回退只在已校验
+  列表内，连接后比对 RemoteAddr；独立 `http.Transport`（`Proxy=nil` 不吃环境代理、
+  自定义 header 不收、不携带 token/Cookie/Authorization/Referer、HTTP/1.1 only、
+  `Accept-Encoding: identity` 非恒等编码即失败、显式重定向循环每跳全查）；仅 200 接受
+  （3xx 按重定向规则，4xx/5xx/206 → `EHTTPStatus`）；**固定浏览器样式 User-Agent**
+  （大量图床 403 拒绝非浏览器 UA），除此之外无任何自定义头。
+- **内容校验**：固定缓冲嗅探前 512 B——PNG/JPEG/GIF/WebP/AVIF 按魔数（PNG 加验 IHDR、
+  AVIF 仅认 avif/avis brand）；SVG 走受限流式 XML 检查（根元素须为 SVG 命名空间的 svg、
+  拒 DTD/<!ENTITY/非 xml 声明的 PI、根须在前 64 KiB），此后按原始字节流转发——**不做任何
+  净化声明**，结果只报实际 MIME；HTML/PDF/任意二进制/不支持类型 → `EImageType`；
+  Content-Type 交叉检查：恒等魔数 + octet-stream/缺失类型可过，显式冲突类型失败。
+  目标扩展名须与检出类型相符（jpg/jpeg 互为别名），不符 → `EImageType` 附检测与建议值；
+  非图片扩展名在下载前即拒（这是**提前拒绝**，不得据此跳过内容校验）。
+- **路径与原子发布**：目标过 §3 管线，一切 FS 操作走 §4 Root 租约；同批解析后重复目标 →
+  相关项全部 `EDuplicateTarget`；已有目录/特殊文件/悬空链接 → 失败（目录报 `EIsDir`）。
+  流程：下载流经「受限 reader + 内容校验 + SHA-256」写入**同目录** O_EXCL 0600 临时文件
+  （复用 §5.2 的 `createTempIn`；sync/chmod 0644 尽力而为）→ 完整合规才进提交段 →
+  目标缺失时 `Root.Link(tmp,target)` **no-replace 原子发布**，成功后删临时名（删失败 →
+  `created` + `warning_code=ETempCleanup`）；Link 撞 EEXIST（并发创建竞争）→ 当场转字节
+  比较；**Link 被共享拒绝**（ENOSYS/EOPNOTSUPP/EPERM/EACCES/EMLINK/EXDEV 类）→ **降级
+  发布**：`O_EXCL` 独占创建最终名 + 从临时文件复制（不覆盖合同由 O_EXCL 保住，牺牲
+  「完整后才可见」，失败尽力清理部分文件），成功项带 `warning_code=EAtomicDegraded` 并记
+  Warn 日志——降级是显式可见的模式，不是静默回退。提交段返回 backend 类错误可能已生效：
+  §8 重试的每次尝试按当前状态重建（目标在→比较；缺→再 Link），不猜测成功。
+  进程崩溃可能遗留 `.file-edit-mcp-` 前缀临时文件：人工清理步骤见 README，不按前缀盲删。
+- **freshness 例外**：upload 不要求 read（比较用内部哈希，不授权后续文本覆盖）；
+  created/skipped 均不记 marker；created 后对调用 token 执行 `Sess.Forget` 清旧标记，
+  不动其它 token 的标记。
+- **HTTP/CIFS 重试分离**：HTTP 错误与下载网络错误**不**自动重试（§5.9 首版）；只有落盘
+  阶段的存储类错误按 §8 重试——流式中途存储失败时关闭 body、清理临时文件、在原预算内
+  **从零重新 GET**（绝不续写半份临时文件）；日志区分远端读错误与本地写错误。
+
 ## 6. 错误目录（errmsg 包，唯一文案来源）
 
 | 代号 | 文案模板（英文，`%s`/`%d` 填充） |
@@ -224,6 +311,24 @@ internal/errmsg/                 错误消息目录（唯一允许拼错误文�
 | EStaleRead | 未读变体：`file has not been read in this session; read it before writing: %s`；stale 变体：`file changed since last read; read it again before editing: %s` |
 | EBackend | `storage backend is unreachable or waking up (CIFS soft mount): %v. Retry shortly; if it persists, check the share server.` |
 | EEditIndex | `edit #%d failed: %v`（multi_edit 包裹层） |
+| ENotDir | `path exists and is not a directory: %s`（mkdir，§5.8） |
+| EInvalidBatch | `invalid upload batch: %s`（调用级，§5.9） |
+| EBusy | `too many concurrent upload batches; retry after the in-flight batches finish`（§5.9） |
+| EInvalidURL | `invalid download URL: %s`（理由为固定词汇表，§5.9） |
+| ESSRFBlocked | `download blocked by address policy: %s does not resolve to a public address`（§5.9） |
+| ERedirectLimit | `too many redirects (limit 3)`（§5.9） |
+| EHTTPStatus | `remote server returned HTTP %d`（§5.9） |
+| EDownload | `download failed: %s`（阶段词汇：dns/connection/tls/response header/response body/content encoding 等，§5.9） |
+| ETimeout | `timed out during %s`（§5.9） |
+| ETooLarge | `image exceeds the per-image byte limit (%d bytes)`（§5.9） |
+| EImageType | `content is not an accepted image type: %s`（§5.9） |
+| EDuplicateTarget | `duplicate target path in this batch: %s`（§5.9） |
+| EExistsConflict | `target exists with different content; upload never overwrites: %s`（§5.9） |
+| ETargetChanged | `target changed while being compared; retry the upload: %s`（§5.9——**不是** EStaleRead：没有可重读的内容，补救是重试 upload） |
+
+upload 的成功 ack 另携带 `warning_code` 常量（非错误）：`ETempCleanup`（提交成功但临时名
+删除失败，遗留文件供运营清理）、`EAtomicDegraded`（走降级发布，§5.9）。`EAtomicPublishUnsupported`
+不存在——Link 不支持**不再是失败**，而是降级模式。
 
 要求：每条错误说清原因 + 给可操作的下一步；不回显整段原文或整个文件。
 
@@ -241,8 +346,13 @@ EStaleRead 是唯一的写栅栏代号（原先独立的「未读就写」代号
   随进程重启重置。统一栅栏（write/edit/multi_edit 同一判定）沿此作用域不变；
   同路径写串行化在 token 内由该 token 的锁表保证，跨 token 由原子 temp+rename + 写前重 stat
   兜底（输家 EStaleRead，绝不静默覆盖）。
-- `internal/session`：`map[resolvedPath]marker{size, mtime}`（read 成功时记录），
-  外加 `map[resolvedPath]*sync.Mutex` 做同路径写串行化。全程持锁访问。
+- `internal/session`：`map[resolvedPath]marker{size, mtime}`（read 成功时记录），外加
+  `PathLocks` 每路径互斥表做同路径串行化（cap-1 通道信号量，`LockContext` 支持按 deadline
+  放弃等待——upload 的比较/提交段等锁不再无限期阻塞）。全程持锁访问。
+- **进程级路径锁**（`Shared.plocks`，同一 `PathLocks` 机制、独立实例、不混 marker）：跨 token
+  的同路径串行化，让 upload 的比较/发布与文本工具的整操作互斥。锁序固定：
+  **进程级路径锁 → Session 路径锁 → Root 租约**；任何 handler 同时只锁一条路径。upload 在
+  **下载完成后**才取目标锁（等待可取消），慢网络不阻塞普通编辑。
 - MCP handler 可能并发调用；所有共享状态经 session 包的锁。
 - stdout 只允许 MCP 协议帧（SDK 负责）；一切日志走 stderr（`log/slog`，`--log-level` 控制，默认 info）。
 
@@ -261,6 +371,13 @@ errno 两类（`errors.Is` + syscall.Errno 判断）：
 - 热态操作遇 backend 类错误：重开 Root（触发重新挂载）后重试 1 次（间隔 800ms），
   再失败 → `EBackend`。
 - 只有 backend 类错误参与重试；确定类错误永不重试。
+- `Retrier.DoContext`（mkdir/upload 用）：策略同 `Do`，但取消检查覆盖首尝试前、每次 OnRetry
+  前与每次退避休眠中——deadline 到期立即以 ctx 错误中止，不再多跑一次 op。`Do` 保持原有
+  无 context 行为（既有工具不变）。Go context 无法强断内核阻塞的系统调用：25s 是可取消
+  阶段的预算，不是内核阻塞的硬保证；禁止把阻塞写入挪进无管理 goroutine 后谎报成功。
+- **upload 的两类重试分离**：HTTP/下载网络错误首版不自动重试；落盘存储类错误按本节策略
+  重试，流式中途失败从零重新 GET（单次 body 不可重放进可重试闭包）。HTTP 与 CIFS 的
+  errno 语义互不串扰（远端 ECONNRESET 不当共享挂载故障）。
 
 ## 9. 测试矩阵（对齐 docs/spec.md §5）
 
@@ -280,14 +397,37 @@ errno 两类（`errors.Is` + syscall.Errno 判断）：
 11. glob 的 mtime 排序、上限截断报告。
 12. grep 三种 output_mode + 无匹配 = 空结果不是错误。
 
+mkdir/upload 补充（§5.8/§5.9）：
+
+13. mkdir：新建/exists/根本身/父缺失/已有文件 ENotDir/相对路径/越界/`..` 边界。
+14. 协议：8 工具发现；空数组/33 项/空字段/超长 URL 为调用级错误；逐项 index 与输入顺序；
+    全失败、部分失败（IsError=true 且带完整 results）、成功（IsError=false）；结果不回显 URL。
+15. SSRF（imagedownload 单元层，注入 resolver/RoundTripper）：私网/loopback/link-local/
+    metadata/CGNAT/保留段全表；IPv6 Unmap/zone/NAT64/6to4/Teredo；混合 DNS 答案整组拒绝；
+    禁端口/userinfo/降级/data:；代理环境变量不生效（Transport 形状断言）；重定向链≤3、
+    每跳重查、指向内网即拒；Content-Length 超限预拒、非恒等编码拒、404/206/429/500。
+16. 内容：PNG/JPEG/GIF/WebP/AVIF/SVG 通过；HTML 冒充/无命名空间 svg/DTD/PI 拒；
+    空 body/截断/超限/max+1；Content-Type 冲突；扩展名不符（附检测与建议）；jpg/jpeg 别名。
+17. 原子性：同内容 skipped（mtime 不动）、不同内容 EExistsConflict（原文件不动）、
+    Link EEXIST 竞争转比较收敛 skipped、Link 不支持 → 降级发布 + EAtomicDegraded 警告 +
+    字节一致、临时清理无残留（tempResidue）、失败无半成品最终文件（原子模式）。
+18. 重试/取消：DoContext 退避中取消立即返回；存储流失败从零重下（恰好 2 次 fetch）；
+    网络错误不重试（恰好 1 次 fetch）。
+19. 并发/freshness：并发下载 ≤4（假 RT 门闩实测）、批次满 EBusy、重复目标 EDuplicateTarget
+    且不 fetch、upload 不记 marker、created 后 Forget（旧标记失效，edit 需重读）、
+    非图片扩展名预检不 fetch。
+
 Diff-XYZ 第一层评测（仅验证 apply 逻辑，不下结论）：脚本从 HF datasets-server rows API
 取 30 条（固定种子、五种语言各 6 条）落成 `testdata/diffxyz-30.jsonl`（入库，测试不碰网络），
 Go 测试把每条 `search-replace` 喂给 editengine，比对 `new_code`。
 
 ## 10. 构建与部署
 
+- 两个镜像都带 CA 证书包（upload 的 HTTPS 出站需要）：canonical 镜像显式
+  `apk add --no-cache ripgrep ca-certificates`（alpine 基底本就含 bundle，显式安装防基底
+  变更踩空）；scratch 发布镜像从 alpine 阶段 `COPY /etc/ssl/certs/ca-certificates.crt`。
 - `Dockerfile`（canonical 多阶段）：`golang:1.27-alpine` 构建 → `alpine:3.20` 运行
-  （`apk add --no-cache ripgrep`）→ 静态二进制 `CGO_ENABLED=0 -trimpath -ldflags "-s -w"`；
+  （`apk add --no-cache ripgrep ca-certificates`）→ 静态二进制 `CGO_ENABLED=0 -trimpath -ldflags "-s -w"`；
   ENTRYPOINT 即二进制，`CMD ["--transport","http","--addr",":8080","--allow","/data"]`
   （compose 可整体覆盖），`EXPOSE 8080`。
 - `Dockerfile.prebuilt`：**发布镜像**，scratch 多阶段（从 alpine:3.20 阶段摘 rg + 三个共享库，
@@ -297,6 +437,8 @@ Go 测试把每条 `search-replace` 喂给 editengine，比对 `new_code`。
   鉴权（容器环境变量 `FILE_EDIT_MCP_TOKENS` 列表或 `FILE_EDIT_MCP_TOKEN` 单 token，端点
   `/{token}/mcp` 每 token 一条；不前置 nginx basic auth）、
   数据子树 bind（见 §0；挂载失效靠宿主机重启容器恢复）。
+  **upload 出站要求**：放行 DNS（UDP/TCP 53）与公网 HTTPS（443）出站；继续用网络策略阻断
+  内网网段与云 metadata 出站——应用层 SSRF 检查不能替代部署边界（纵深防御）。
 - CLI：`--allow DIR`（可重复，≥1）、`--transport stdio|http`、`--addr`（http 用）、
   `--keepalive DURATION`（http 用，默认 4m，0 关闭）、`--log-level`、`--version`。
   环境变量：`FILE_EDIT_MCP_TOKENS`（http 必填其一：逗号分隔 token 列表，每 token 一条端点
@@ -308,3 +450,7 @@ Go 测试把每条 `search-replace` 喂给 editengine，比对 `new_code`。
 T1 脚手架 → T2 pathguard+errmsg → T3 editengine → T4 lineio → T5 session+cifsops
 （T2–T5 可并行）→ T6 组装 read/write/edit/multi_edit → T7 glob+grep（可与 T6 并行）
 → T8 集成测试 → T9 Diff-XYZ 第一层 → T10 Docker/部署/README。
+T11 mkdir+upload（§5.8/§5.9）：errmsg 扩行 → cifsops DoContext/Root 租约 → session
+PathLocks → imagedownload → tools 组装与全工具锁序迁移 → 测试 → 镜像 CA/文档。上线前
+须真实 CIFS soft 挂载验收：Link 支持性（决定原子/降级模式）、遗留临时文件清理、超时实际
+偏差；RSS≤20 MB 增量实测。

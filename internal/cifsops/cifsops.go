@@ -21,6 +21,7 @@
 package cifsops
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"syscall"
@@ -127,6 +128,11 @@ type Retrier struct {
 	// a recorder so nothing actually waits.
 	Sleep func(time.Duration)
 
+	// CtxSleep pauses between attempts for DoContext, cancellably.
+	// Defaults to a timer + select on ctx.Done; tests inject a recorder.
+	// Do (the context-free form) never consults it.
+	CtxSleep func(ctx context.Context, d time.Duration) error
+
 	mu        sync.Mutex
 	succeeded bool
 }
@@ -140,6 +146,34 @@ type Retrier struct {
 // WarmRetryDelay. On exhaustion the last backend error is returned raw —
 // the caller (outside this package) wraps it in the EBackend message.
 func (r *Retrier) Do(op func() error) error {
+	sleepFor := r.sleepFunc()
+	return r.do(context.Background(), op, func(_ context.Context, d time.Duration) error {
+		sleepFor(d)
+		return nil
+	})
+}
+
+// DoContext is Do with a cancellable context (§8, the upload/mkdir form):
+// the policy is identical, but cancellation is checked before the first
+// attempt, before every OnRetry hook, and during every backoff sleep — a
+// canceled or deadline-expired context aborts the wait loop immediately
+// with ctx.Err() and never runs another op() attempt. The long-budget
+// handlers (mkdir, upload) use this so their deadlines actually fence the
+// retry machinery; Do keeps its historical context-free behavior for the
+// existing tools.
+func (r *Retrier) DoContext(ctx context.Context, op func() error) error {
+	return r.do(ctx, op, r.ctxSleepFunc())
+}
+
+// do is the shared Do/DoContext core: run op; on a backend-class error,
+// retry per the cold/warm backoff schedule with OnRetry before each
+// attempt. sleep gates each wait and returns a non-nil error only when the
+// wait was cancelled (the DoContext form); the plain Do form passes a
+// wrapper around the classic Sleep field that never cancels.
+func (r *Retrier) do(ctx context.Context, op func() error, sleep func(context.Context, time.Duration) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	err := op()
 	if err == nil {
 		r.markSucceeded()
@@ -155,14 +189,18 @@ func (r *Retrier) Do(op func() error) error {
 	} else {
 		backoff = ColdBackoff[:]
 	}
-	sleep := r.sleepFunc()
 	for attempt, delay := range backoff {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if r.OnRetry != nil {
 			if hookErr := r.OnRetry(attempt + 1); hookErr != nil {
 				return hookErr
 			}
 		}
-		sleep(delay)
+		if err := sleep(ctx, delay); err != nil {
+			return err
+		}
 		err = op()
 		if err == nil {
 			r.markSucceeded()
@@ -196,4 +234,26 @@ func (r *Retrier) sleepFunc() func(time.Duration) {
 		return r.Sleep
 	}
 	return time.Sleep
+}
+
+// ctxSleepFunc resolves the injected or default cancellable sleep used by
+// DoContext. The default waits on a timer raced against ctx.Done, so a
+// canceled context never waits out a backoff interval.
+func (r *Retrier) ctxSleepFunc() func(context.Context, time.Duration) error {
+	if r.CtxSleep != nil {
+		return r.CtxSleep
+	}
+	return sleepContext
+}
+
+// sleepContext waits for d unless ctx finishes first.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

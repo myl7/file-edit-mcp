@@ -1,9 +1,9 @@
 // Tool descriptors (final descriptions from T1) and input/output parameter
-// structs (§5) for all six tools.
+// structs (§5) for all eight tools.
 //
-// The handlers live in read.go/write.go/edit.go (read/write/edit/multi_edit)
-// and glob.go/grep.go, all methods on *Conn (server.go): one Conn per MCP
-// connection over the process-wide *Shared.
+// The handlers live in read.go/write.go/edit.go (read/write/edit/multi_edit),
+// glob.go/grep.go, and mkdir.go/upload.go, all methods on *Conn (server.go):
+// one Conn per MCP connection over the process-wide *Shared.
 
 package tools
 
@@ -21,6 +21,10 @@ const toolDescMultiEdit = `Apply an ordered list of edits to one file, each matc
 const toolDescGlob = `List files matching a doublestar glob pattern (** supported) as absolute paths sorted by modification time, newest first. Absolute paths only; the path search root must be within the allowed roots configured via --allow, and it defaults to all allowed roots. The pattern is matched against paths relative to the search root, so an absolute pattern matches nothing. At most 200 results are returned, truncated entries are reported as "showing X of Y", and the directory scan stops once 100,000 entries have been traversed, after which results are declared possibly incomplete.`
 
 const toolDescGrep = `Search file contents with a regular expression and report matches via output_mode: files_with_matches (default), content, or count. Absolute paths only; the path search root must be within the allowed roots configured via --allow, and it defaults to all allowed roots. glob is a single filename filter ("!pattern" excludes). A search is killed after a 120 second timeout and returns the partial results with a timeout notice. Narrow the scope with path and glob before searching — scanning an entire allowed root can be slow on a large share.`
+
+const toolDescMkdir = `Create a directory, a single level per call; parent directories are never created, so build deeper paths one level at a time. Absolute paths only; every path must stay within the allowed roots configured via --allow. Creating an already-existing directory returns status "exists" instead of an error, and a path that already holds a regular file is rejected. The call is idempotent: repeated creates of the same path converge to the same directory.`
+
+const toolDescUpload = `Download images over HTTPS and create each one at its absolute file_path under the allowed roots configured via --allow; only png, jpg, jpeg, gif, webp, avif, and svg files are accepted and the extension must match the detected content. Parent directories are never created (call mkdir first), and an existing target is never overwritten: identical content is reported as skipped, different content is an error naming the target. Every item reports status created, skipped, or failed with a stable error_code, and the whole call is an error result when any item failed — retry just the failed items, since the same content converges to skipped. A batch carries 1-32 files, each image is capped at 20 MiB, one image gets 10 seconds and the whole batch 25 seconds, so use small batches for slow sources. Only plain https URLs (no credentials) are fetched, redirects are followed up to 3 hops, and non-public addresses are refused.`
 
 // Input/output parameter structs per ARCHITECTURE §5. JSON field names are
 // snake_case. Parameters that §5 declares optional or defaulted carry
@@ -106,4 +110,64 @@ type GrepInput struct {
 type GrepOutput struct {
 	Results []string `json:"results"`
 	Note    string   `json:"note,omitempty"`
+}
+
+// MkdirInput is the input of the mkdir tool (§5.8).
+type MkdirInput struct {
+	DirPath string `json:"dir_path"`
+}
+
+// MkdirOutput is the output of the mkdir tool: the resolved directory and
+// whether this call created it or found it already present.
+type MkdirOutput struct {
+	DirPath string `json:"dir_path"`
+	Status  string `json:"status"` // created | exists
+}
+
+// UploadItem is one entry of upload's files array (§5.9).
+type UploadItem struct {
+	URL      string `json:"url"`
+	FilePath string `json:"file_path"`
+}
+
+// UploadInput is the input of the upload tool (§5.9).
+type UploadInput struct {
+	Files []UploadItem `json:"files"`
+}
+
+// UploadItemResult is the per-item outcome, in input order; index is
+// 1-based to match multi_edit's failing-edit convention. Success fields
+// (bytes/sha256/content_type) are set for created and skipped; failure
+// fields (error_code/error) for failed; detected_content_type and
+// suggested_extension ride EImageType mismatches so the caller can pick a
+// new path without re-downloading blind; warning_code carries post-commit
+// side-effect notices (ETempCleanup, EAtomicDegraded) on a created item.
+type UploadItemResult struct {
+	Index               int    `json:"index"`
+	FilePath            string `json:"file_path"`
+	Status              string `json:"status"` // created | skipped | failed
+	Bytes               int64  `json:"bytes,omitempty"`
+	SHA256              string `json:"sha256,omitempty"`
+	ContentType         string `json:"content_type,omitempty"`
+	ErrorCode           string `json:"error_code,omitempty"`
+	Error               string `json:"error,omitempty"`
+	DetectedContentType string `json:"detected_content_type,omitempty"`
+	SuggestedExtension  string `json:"suggested_extension,omitempty"`
+	WarningCode         string `json:"warning_code,omitempty"`
+}
+
+// UploadSummary counts the item statuses; the counts always add up to the
+// input length.
+type UploadSummary struct {
+	Created int `json:"created"`
+	Skipped int `json:"skipped"`
+	Failed  int `json:"failed"`
+}
+
+// UploadOutput is the whole-call output of the upload tool (§5.9). The
+// source URL is deliberately never echoed here — signatures live in URL
+// queries and must not bounce back into the model transcript.
+type UploadOutput struct {
+	Results []UploadItemResult `json:"results"`
+	Summary UploadSummary      `json:"summary"`
 }

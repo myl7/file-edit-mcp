@@ -22,16 +22,33 @@ import (
 // NewRootPool; a RootPool is safe for concurrent use.
 //
 // Go 1.27 os.Root method set used here (verified with `go doc os.Root`):
-// OpenRoot, Open, OpenFile, Stat, ReadFile, Rename, Remove, Chmod, Close.
-// os.Root has NO CreateTemp, so §5.2 temp files are created with
+// OpenRoot, Open, OpenFile, Stat, ReadFile, Rename, Remove, Chmod, Link,
+// Close. os.Root has NO CreateTemp, so §5.2 temp files are created with
 // OpenFile(O_WRONLY|O_CREATE|O_EXCL) plus a random name (see tools layer) —
 // this stays inside the Root's confinement and needs no os.CreateTemp
-// fallback, so no TOCTOU window is reintroduced. Rename exists on Root, so
-// os.Rename is never used either. No cgo anywhere.
+// fallback, so no TOCTOU window is reintroduced. Rename and Link exist on
+// Root, so os.Rename/os.Link are never used either. No cgo anywhere.
+//
+// Two access forms exist (§4):
+//
+//   - WithRoot (preferred): op runs under a READ lease; ReopenAll takes the
+//     matching WRITE lease, so a reopen waits for in-flight operations
+//     instead of closing a Root under them. The upload pipeline requires
+//     this — a streaming download holds its lease for seconds, and the old
+//     close-under-use race would fail it spuriously.
+//   - Resolve (legacy): returns the cached Root for callers that hold an
+//     outer serialization (the pre-lease tools did). ReopenAll may close a
+//     Resolve-handed Root mid-use; the residual race is the documented §4
+//     behavior. New code uses WithRoot.
 type RootPool struct {
 	// mu guards roots; it is held while opening/closing Roots but never
 	// across a caller's use of a Root (os.Root is itself goroutine-safe).
 	mu sync.Mutex
+	// lease is the WithRoot read/write lease: operations hold the read
+	// side while using a Root, ReopenAll holds the write side while
+	// swapping them. It is never held across Resolve itself (Resolve users
+	// accept the legacy race).
+	lease sync.RWMutex
 	// dirs are the canonicalized allowed directories (startup-fixed; the
 	// same list pathguard validated against). Used for prefix matching.
 	dirs []string
@@ -60,11 +77,44 @@ func (p *RootPool) Open(path string) (*os.Root, error) {
 	return root, err
 }
 
+// WithRoot resolves path, runs op with the resolved Root and Root-relative
+// name under a READ lease, and returns op's error (§4). While op runs,
+// ReopenAll cannot swap the Roots: it blocks on the matching write lease
+// until every in-flight WithRoot operation finishes. That is the point —
+// the §4 close-under-use race of the legacy Resolve form cannot hit a
+// WithRoot caller.
+//
+// Rules for op (they follow from the lease):
+//   - op must be one bounded filesystem step (or a short sequence), not an
+//     unbounded wait: a ReopenAll triggered by another goroutine's backend
+//     retry will queue behind the lease until op returns.
+//   - op must NOT run a §8 Retrier that fires OnRetry (ReopenAll) — the
+//     reopen would deadlock on the lease this op still holds. Structure
+//     retrying operations as WithRoot inside each retried attempt, never
+//     around the retrier.
+func (p *RootPool) WithRoot(path string, op func(root *os.Root, rel string) error) error {
+	p.lease.RLock()
+	defer p.lease.RUnlock()
+	root, rel, err := p.resolve(path)
+	if err != nil {
+		return err
+	}
+	return op(root, rel)
+}
+
 // Resolve is Open plus the Root-relative name for path: the value to pass
 // to the returned Root's methods. The relative name never contains ".."
 // because owner() only matches real subpaths. For path equal to an allowed
 // directory the name is "." (the directory itself).
+//
+// Legacy form (§4): the Root is handed out without a lease, so a
+// concurrent ReopenAll may close it mid-use. Prefer WithRoot.
 func (p *RootPool) Resolve(path string) (*os.Root, string, error) {
+	return p.resolve(path)
+}
+
+// resolve is the Resolve body under p.mu (lazy open + cache).
+func (p *RootPool) resolve(path string) (*os.Root, string, error) {
 	dir := p.owner(path)
 	if dir == "" {
 		return nil, "", fmt.Errorf("cifsops: path %s is outside every pooled root", path)
@@ -90,14 +140,16 @@ func (p *RootPool) Resolve(path string) (*os.Root, string, error) {
 // blocks in the kernel until the automount is live again. Directories that
 // were never opened stay lazy — their next Open is a fresh open anyway.
 //
-// Residual race, accepted per §4: ReopenAll may close a Root another
-// goroutine is still using (concurrent handlers on different paths share
-// one Root). That operation fails with a closed-Root error (unknown class,
-// not retried) while the in-flight caller's own path is unaffected by the
-// mount jitter; the next tool call resolves a fresh Root via Open. Same-path
-// callers never see this because handlers hold the session lock across the
-// whole operation.
+// It runs under the WithRoot WRITE lease: in-flight WithRoot operations
+// finish first, so no operation observes a Root closed underneath it (the
+// Resolve legacy form still carries the residual race documented on it).
+// The lease also serializes concurrent reopens; the write lease is held
+// for the whole close+reopen pass so a mid-pass Open never caches a Root
+// the pass is about to replace.
 func (p *RootPool) ReopenAll() error {
+	p.lease.Lock()
+	defer p.lease.Unlock()
+
 	p.mu.Lock()
 	opened := make(map[string]*os.Root, len(p.roots))
 	for dir, root := range p.roots {

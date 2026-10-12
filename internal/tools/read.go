@@ -5,6 +5,7 @@ package tools
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -17,7 +18,7 @@ import (
 // the three output limits, and the continuation footer whenever the read
 // did not reach EOF. A successful read records the session marker so later
 // writes/edits on the same path pass the read-first check.
-func (s *Conn) Read(_ context.Context, _ *mcp.CallToolRequest, in ReadInput) (*mcp.CallToolResult, ReadOutput, error) {
+func (s *Conn) Read(ctx context.Context, _ *mcp.CallToolRequest, in ReadInput) (*mcp.CallToolResult, ReadOutput, error) {
 	// §5.1: offset defaults to 1, limit to DefaultLines (2000). The zero
 	// value is the "absent" signal; explicitly negative values are argument
 	// errors caught by ValidateArgs.
@@ -37,8 +38,15 @@ func (s *Conn) Read(_ context.Context, _ *mcp.CallToolRequest, in ReadInput) (*m
 		return nil, ReadOutput{}, err
 	}
 
-	// §7: serialize with writers on the same path so the marker we record
-	// describes a quiescent file (no torn read across a concurrent rename).
+	// §7 order: the process-level path lock first (§5.9 added it so an
+	// upload's compare/publish cannot interleave with a read of the same
+	// resolved path across tokens), then the per-path session lock so the
+	// marker we record describes a quiescent file.
+	release, err := s.Shared.plocks.LockContext(ctx, resolved)
+	if err != nil {
+		return nil, ReadOutput{}, errmsg.ETimeout("read")
+	}
+	defer release()
 	unlock := s.Sess.LockFile(resolved)
 	defer unlock()
 
@@ -51,22 +59,23 @@ func (s *Conn) Read(_ context.Context, _ *mcp.CallToolRequest, in ReadInput) (*m
 	// the recorded marker is the pre-change state and any later edit on the
 	// post-change file detects EStaleRead instead of silently proceeding.
 	snap, err := runFS(s, resolved, func() (*readSnap, error) {
-		root, rel, err := s.Roots.Resolve(resolved)
-		if err != nil {
-			return nil, err
-		}
-		info, err := root.Stat(rel)
-		if err != nil {
-			return nil, err
-		}
-		if info.IsDir() {
-			return nil, errmsg.EIsDir(resolved)
-		}
-		data, err := root.ReadFile(rel)
-		if err != nil {
-			return nil, err
-		}
-		return &readSnap{content: data, size: info.Size(), mtime: info.ModTime()}, nil
+		var out *readSnap
+		err := s.Roots.WithRoot(resolved, func(root *os.Root, rel string) error {
+			info, err := root.Stat(rel)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return errmsg.EIsDir(resolved)
+			}
+			data, err := root.ReadFile(rel)
+			if err != nil {
+				return err
+			}
+			out = &readSnap{content: data, size: info.Size(), mtime: info.ModTime()}
+			return nil
+		})
+		return out, err
 	})
 	if err != nil {
 		return nil, ReadOutput{}, mapFSErr(err, resolved)

@@ -18,8 +18,11 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
     -o /out/file-edit-mcp ./cmd/file-edit-mcp
 
 FROM alpine:3.20
-# ripgrep backs the grep tool (ARCHITECTURE.md §5.6).
-RUN apk add --no-cache ripgrep
+# ripgrep backs the grep tool (ARCHITECTURE.md §5.6); ca-certificates keeps
+# the upload tool's outbound HTTPS verifiable (§5.9). The alpine base ships
+# ca-certificates-bundle already — installing the package explicitly pins
+# the dependency against base-image changes.
+RUN apk add --no-cache ripgrep ca-certificates
 
 COPY --from=build /out/file-edit-mcp /usr/local/bin/file-edit-mcp
 RUN chmod 0755 /usr/local/bin/file-edit-mcp

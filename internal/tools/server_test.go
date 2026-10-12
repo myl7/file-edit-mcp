@@ -161,7 +161,7 @@ func readTool(t *testing.T, cs *mcp.ClientSession, path string, extraArgs map[st
 	return out
 }
 
-// TestRegisterListsAllTools verifies a client sees exactly the six tools
+// TestRegisterListsAllTools verifies a client sees exactly the eight tools
 // with non-empty descriptions after initialize + tools/list.
 func TestRegisterListsAllTools(t *testing.T) {
 	cs, _, _ := startTestServer(t)
@@ -170,7 +170,7 @@ func TestRegisterListsAllTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"read", "write", "edit", "multi_edit", "glob", "grep"}
+	want := []string{"read", "write", "edit", "multi_edit", "glob", "grep", "mkdir", "upload"}
 	if len(res.Tools) != len(want) {
 		t.Fatalf("got %d tools, want %d", len(res.Tools), len(want))
 	}

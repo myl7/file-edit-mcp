@@ -729,3 +729,64 @@ func jsonQuote(s string) string {
 	}
 	return string(b)
 }
+
+// TestHTTPEightToolsDiscovery: over the stateless HTTP transport the client
+// sees all eight tools, and the two §5.8/§5.9 additions carry annotations
+// that never mislabel them read-only (the §11 implementation note: mkdir
+// and upload mutate the share; upload additionally touches the outside
+// world, so its open-world hint stays true).
+func TestHTTPEightToolsDiscovery(t *testing.T) {
+	ts, _ := startHTTPTestServer(t)
+	cs := connectHTTP(t, ts)
+
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"read": false, "write": false, "edit": false, "multi_edit": false,
+		"glob": false, "grep": false, "mkdir": false, "upload": false,
+	}
+	for _, tool := range res.Tools {
+		if _, ok := want[tool.Name]; !ok {
+			t.Errorf("unexpected tool %q in tools/list", tool.Name)
+			continue
+		}
+		want[tool.Name] = true
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("tool %q missing from tools/list over HTTP", name)
+		}
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "mkdir" && tool.Name != "upload" {
+			continue
+		}
+		if tool.Annotations == nil {
+			t.Fatalf("%s has no annotations", tool.Name)
+		}
+		if tool.Annotations.ReadOnlyHint {
+			t.Errorf("%s annotated read-only", tool.Name)
+		}
+		if tool.Annotations.DestructiveHint != nil && *tool.Annotations.DestructiveHint {
+			t.Errorf("%s annotated destructive", tool.Name)
+		}
+		if !tool.Annotations.IdempotentHint {
+			t.Errorf("%s not annotated idempotent (same content converges)", tool.Name)
+		}
+	}
+	if o := res.Tools[toolIndex(res, "upload")].Annotations.OpenWorldHint; o == nil || !*o {
+		t.Error("upload missing open-world hint")
+	}
+}
+
+func toolIndex(res *mcp.ListToolsResult, name string) int {
+	for i, t := range res.Tools {
+		if t.Name == name {
+			return i
+		}
+	}
+	return -1
+}

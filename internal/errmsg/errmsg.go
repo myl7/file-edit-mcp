@@ -34,6 +34,35 @@ var (
 	ErrStaleRead     = errors.New("EStaleRead")
 	ErrBackend       = errors.New("EBackend")
 	ErrEditIndex     = errors.New("EEditIndex")
+	// mkdir / upload rows (§5.8/§5.9).
+	ErrNotDir          = errors.New("ENotDir")
+	ErrInvalidBatch    = errors.New("EInvalidBatch")
+	ErrBusy            = errors.New("EBusy")
+	ErrInvalidURL      = errors.New("EInvalidURL")
+	ErrSSRFBlocked     = errors.New("ESSRFBlocked")
+	ErrRedirectLimit   = errors.New("ERedirectLimit")
+	ErrHTTPStatus      = errors.New("EHTTPStatus")
+	ErrDownload        = errors.New("EDownload")
+	ErrTimeout         = errors.New("ETimeout")
+	ErrTooLarge        = errors.New("ETooLarge")
+	ErrImageType       = errors.New("EImageType")
+	ErrDuplicateTarget = errors.New("EDuplicateTarget")
+	ErrExistsConflict  = errors.New("EExistsConflict")
+	ErrTargetChanged   = errors.New("ETargetChanged")
+)
+
+// Warning codes for upload success acks (§5.9). These are not errors: they
+// ride a created result's warning_code field when the commit succeeded but
+// a side effect (temp cleanup, atomicity level) needs operator attention.
+const (
+	// CodeTempCleanup: the final name was published but removing the temp
+	// name failed; the leftover file keeps the temp prefix and needs manual
+	// cleanup.
+	CodeTempCleanup = "ETempCleanup"
+	// CodeAtomicDegraded: the share rejected hard links, so the file landed
+	// via the degraded no-replace path (exclusive create + copy) instead of
+	// the atomic link publish (§5.9 degraded mode).
+	CodeAtomicDegraded = "EAtomicDegraded"
 )
 
 // Error is the concrete type every constructor returns. Error() renders
@@ -174,6 +203,118 @@ func EBackend(cause error) error {
 func EEditIndex(index int, cause error) error {
 	return &Error{sentinel: ErrEditIndex, cause: cause, msg: fmt.Sprintf(
 		"edit #%d failed: %v", index, nonNil(cause))}
+}
+
+// ENotDir reports a mkdir target that exists but is not a directory (§5.8).
+func ENotDir(path string) error {
+	return &Error{sentinel: ErrNotDir, msg: fmt.Sprintf(
+		"path exists and is not a directory: %s", path)}
+}
+
+// EInvalidBatch rejects an upload call's batch shape (§5.9): wrong item
+// count, empty fields, oversized URL. It is a call-level error (the whole
+// tools/call is an error result), so detail names the offending position.
+func EInvalidBatch(detail string) error {
+	return &Error{sentinel: ErrInvalidBatch, msg: fmt.Sprintf(
+		"invalid upload batch: %s", detail)}
+}
+
+// EBusy reports that the process-wide concurrent-batch limit is exhausted
+// (§5.9): the call is rejected before any item starts, and retrying after
+// the in-flight batches drain is the remedy.
+func EBusy() error {
+	return &Error{sentinel: ErrBusy, msg: fmt.Sprintf(
+		"too many concurrent upload batches; retry after the in-flight batches finish")}
+}
+
+// EInvalidURL is the per-item URL policy rejection (§5.9). reason comes
+// from the imagedownload package's fixed vocabulary — never the raw URL.
+func EInvalidURL(reason string) error {
+	return &Error{sentinel: ErrInvalidURL, msg: fmt.Sprintf(
+		"invalid download URL: %s", reason)}
+}
+
+// ESSRFBlocked reports the address policy verdict (§5.9): host is the URL
+// host only (never the path or query).
+func ESSRFBlocked(host string) error {
+	return &Error{sentinel: ErrSSRFBlocked, msg: fmt.Sprintf(
+		"download blocked by address policy: %s does not resolve to a public address", host)}
+}
+
+// ERedirectLimit reports a redirect chain longer than the hop limit (§5.9).
+func ERedirectLimit() error {
+	return &Error{sentinel: ErrRedirectLimit, msg: "too many redirects (limit 3)"}
+}
+
+// EHTTPStatus reports a non-200 final response (§5.9). Only the status code
+// is carried; the remote body and headers never reach the model.
+func EHTTPStatus(status int) error {
+	return &Error{sentinel: ErrHTTPStatus, msg: fmt.Sprintf(
+		"remote server returned HTTP %d", status)}
+}
+
+// EDownload reports a network-level download failure (§5.9). stage is a
+// fixed-vocabulary phrase ("connection failed", "tls handshake failed", ...)
+// from the imagedownload package — raw url.Error text never gets here.
+func EDownload(stage string) error {
+	return &Error{sentinel: ErrDownload, msg: fmt.Sprintf(
+		"download failed: %s", stage)}
+}
+
+// ETimeout reports a budget expiry (§5.9): stage names what was underway
+// ("dns", "download", "compare", "batch", ...).
+func ETimeout(stage string) error {
+	return &Error{sentinel: ErrTimeout, msg: fmt.Sprintf(
+		"timed out during %s", stage)}
+}
+
+// ETooLarge reports content over the per-image byte limit (§5.9).
+func ETooLarge(limit int64) error {
+	return &Error{sentinel: ErrTooLarge, msg: fmt.Sprintf(
+		"image exceeds the per-image byte limit (%d bytes)", limit)}
+}
+
+// EImageType rejects the downloaded content (§5.9): not an accepted image
+// type, a type/explicit-Content-Type conflict, or a target extension that
+// does not match the detected type (reason says which).
+func EImageType(reason string) error {
+	return &Error{sentinel: ErrImageType, msg: fmt.Sprintf(
+		"content is not an accepted image type: %s", reason)}
+}
+
+// EDuplicateTarget reports two batch items resolving to the same target
+// path (§5.9): all items sharing the resolved path fail; the rest continue.
+func EDuplicateTarget(path string) error {
+	return &Error{sentinel: ErrDuplicateTarget, msg: fmt.Sprintf(
+		"duplicate target path in this batch: %s", path)}
+}
+
+// EExistsConflict reports an existing target whose bytes differ from the
+// download (§5.9): upload never overwrites, so the caller must pick a new
+// path (or delete the target out of band) and retry.
+func EExistsConflict(path string) error {
+	return &Error{sentinel: ErrExistsConflict, msg: fmt.Sprintf(
+		"target exists with different content; upload never overwrites: %s", path)}
+}
+
+// ETargetChanged reports an existing target whose size/mtime moved while it
+// was being byte-compared (§5.9). Unlike EStaleRead there is no read to
+// redo — the remedy is to retry the upload.
+func ETargetChanged(path string) error {
+	return &Error{sentinel: ErrTargetChanged, msg: fmt.Sprintf(
+		"target changed while being compared; retry the upload: %s", path)}
+}
+
+// Code returns the catalog code string (the sentinel's name, e.g.
+// "EHTTPStatus") for err, or "" when err is not a catalog error. upload's
+// per-item results carry it as error_code so callers can branch without
+// parsing message text.
+func Code(err error) string {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.sentinel.Error()
+	}
+	return ""
 }
 
 // FormatDirs renders the allowed-roots list for the catalog templates.
