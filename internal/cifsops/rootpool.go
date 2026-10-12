@@ -203,12 +203,19 @@ func withinPrefix(dir, path string) bool {
 
 // relName converts an absolute path under dir into its Root-relative name.
 // owner() guarantees path is dir itself or a true subpath, so the prefix
-// strip cannot fail and never yields "..".
+// strip cannot fail and never yields "..". The "/" allowed root needs its
+// own strip: dir+"/" would be "//", which never prefixes a real POSIX
+// path (the same double-slash boundary pathguard §3 special-cases).
 func relName(dir, path string) string {
 	if path == dir {
 		return "."
 	}
-	rel := strings.TrimPrefix(path, dir+"/")
+	var rel string
+	if dir == "/" {
+		rel = strings.TrimPrefix(path, "/")
+	} else {
+		rel = strings.TrimPrefix(path, dir+"/")
+	}
 	if cleaned := filepath.Clean(rel); cleaned != rel {
 		// Cannot happen for validated paths; keep the Root contract safe.
 		return cleaned

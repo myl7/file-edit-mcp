@@ -212,3 +212,21 @@ func TestRootPoolConcurrentOpen(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveUnderRootAllowedDir: the "/" allowed root (the pathguard §3
+// double-slash boundary) must produce plain relative names — found by the
+// v0.6.1 deploy smoke test, where dir+"/" ("//") never stripped and the
+// absolute path escaped the Root.
+func TestResolveUnderRootAllowedDir(t *testing.T) {
+	p := NewRootPool([]string{"/"})
+	_, rel, err := p.Resolve("/a/b.txt")
+	if err != nil {
+		t.Fatalf("Resolve(/a/b.txt) under allow /: %v", err)
+	}
+	if rel != "a/b.txt" {
+		t.Fatalf("rel = %q, want a/b.txt", rel)
+	}
+	if _, rel, _ := p.Resolve("/"); rel != "." {
+		t.Fatalf("rel for the root itself = %q, want .", rel)
+	}
+}
